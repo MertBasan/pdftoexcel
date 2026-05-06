@@ -2,32 +2,10 @@
 Bank Statement → CSV/Excel Extractor (Accountant-Grade)
 ========================================================
 
-Key design points
------------------
-* Text-based extraction (NOT OCR). PDFs from major Turkish banks are digitally
-  generated and fully text-extractable; OCR would only add error.
-* Per-bank parsers. Currently: Halkbank. Bank is auto-detected by fingerprint.
-* Two mathematical accuracy checks on every file:
-    1. Balance chain: prev_Bakiye + current_TUTAR == current_Bakiye for every
-       consecutive row pair. If even one row fails, extraction broke.
-    2. Final balance: last extracted Bakiye must equal the "Hesap Bakiyesi"
-       printed on the statement header.
-  Both green ⇒ TUTAR and Bakiye are bit-exact what's in the PDF.
+Supported banks: Halkbank (V1 + V2 layouts), Akbank.
+Unknown banks: generic fallback parser with auto-detected row patterns.
 
-Output columns (per user spec)
-------------------------------
-TARİH | Saat | TUTAR | Bakiye | AÇIKLAMA | DEKONT
-
-Notes per bank
---------------
-Halkbank PDFs do NOT contain a Saat column or a separate DEKONT column. For
-Halkbank:
-  * Saat is left empty (source has no time-of-day field).
-  * DEKONT is best-effort: the trailing 10+ digit reference number after the
-    last "/" in POS-style descriptions. HAVALE/transfer rows have no DEKONT.
-
-Tested against a 48-page, 1,644-transaction Halkbank statement: 0 balance-chain
-mismatches, final balance reconciles to the header (18.707,63 = 18.707,63).
+Output columns: TARİH | Saat | TUTAR | Bakiye | AÇIKLAMA | DEKONT
 """
 
 from __future__ import annotations
@@ -50,10 +28,6 @@ import streamlit as st
 # =============================================================================
 
 def parse_tr_decimal(s: str) -> Decimal:
-    """Convert Turkish-formatted number string to Decimal.
-
-    Examples: '1.234,56' -> Decimal('1234.56'); '-476,19' -> Decimal('-476.19').
-    """
     s = s.strip()
     if not s:
         raise InvalidOperation("empty number string")
@@ -125,10 +99,10 @@ class StatementResult:
 
 def detect_bank(full_text: str) -> Optional[str]:
     head = full_text[:5000].upper()
-    if 'HALKBANK' in head or 'TÜRKIYE HALK BANKASI' in head or 'TURKIYE HALK BANKASI' in head:
-        return 'HALKBANK'
     if 'AKBANK' in head or 'AKPOS' in head:
         return 'AKBANK'
+    if 'HALKBANK' in head or 'TÜRKIYE HALK BANKASI' in head or 'TURKIYE HALK BANKASI' in head:
+        return 'HALKBANK'
     if 'GARANTİ' in head or 'GARANTI BANKASI' in head:
         return 'GARANTI'
     if 'İŞ BANKASI' in head or 'IS BANKASI' in head or 'TÜRKİYE İŞ BANKASI' in head:
@@ -148,15 +122,22 @@ _HB_SKIP_CONT_PREFIXES = (
     'Müşteri', 'Hesap', 'TCKN', 'IBAN', 'Şube', 'Döviz', 'Üretim', 'Dönemi',
     'Bakiye Bilgi', 'Bloke', 'Kullanıl', 'Toplam Kredi',
     'Türkiye Halk', 'yerine kullanıl', 'Uyuşmazlık',
+    'MÜŞTERİ', 'Dönem',
 )
 _HB_SKIP_EXACT = {'HESAP ÖZETİ'}
 
 _HB_NUM = r'-?[\d.]+,\d{2}'
-_HB_ROW = re.compile(rf'^(\d{{2}}-\d{{2}}-\d{{4}})\s+({_HB_NUM})\s+({_HB_NUM})\s+(.*)$')
+_HB_ROW_V1 = re.compile(rf'^(\d{{2}}-\d{{2}}-\d{{4}})\s+({_HB_NUM})\s+({_HB_NUM})\s+(.*)$')
 
-# Best-effort DEKONT for Halkbank: last "/" followed by 10+ digits at end of
-# the joined description. Catches POS Satis / POS Aidat / Komisyon receipts.
-# HAVALE rows end with a masked IBAN (TR54***...8675) and produce no DEKONT.
+_HB_NUM_UNSIGNED = r'[\d.]+,\d{2}'
+_HB_ROW_V2 = re.compile(
+    rf'^(\d{{2}}\.\d{{2}}\.\d{{4}})\s+'
+    rf'\d{{2}}\.\d{{2}}\.\d{{4}}\s+'
+    rf'({_HB_NUM_UNSIGNED})\s+([+-])\s+'
+    rf'({_HB_NUM_UNSIGNED})\s+([+-])\s+'
+    rf'(.*)$'
+)
+
 _HB_DEKONT_RE = re.compile(r'/(\d{10,})\s*$')
 
 
@@ -166,16 +147,6 @@ def _hb_extract_dekont(description: str) -> str:
 
 
 def _hb_strip_right_column(line: str) -> str:
-    """Halkbank's cover page is a two-column layout. pdfplumber merges
-    same-baseline content from both columns onto a single line. Strip away
-    the right-column part so we can read left-column values cleanly.
-
-    Example input:
-        'Şube Kodu / Adı :GÜLTEPE / ISTANBUL SB. Kullanılabilir Kredi Limiti :0,00'
-    Example output:
-        'Şube Kodu / Adı :GÜLTEPE / ISTANBUL SB.'
-    """
-    # Right-column labels that may be merged onto a left-column line
     right_anchors = (
         r'\s+(?:Üretim\s+Zamanı|Dönemi|Hesap\s+Bakiyesi|Bloke\s+Bakiyesi|'
         r'Kullanılabilir(?:\s+\w+)*|Toplam\s+Kredi|Bakiye\s+Bilgileriniz|'
@@ -185,42 +156,28 @@ def _hb_strip_right_column(line: str) -> str:
 
 
 def _hb_extract_customer_name(text: str) -> str:
-    """Extract the (possibly multi-line) customer name.
-
-    The label 'Müşteri Adı / Ünvanı :' wraps to two visual lines in the PDF.
-    Because of that, pdfplumber emits the customer name's FIRST line BEFORE
-    the label line, and the SECOND line AFTER it. Concretely:
-
-        line N-1: SEM LOKANTA SANAYI VE TICARET LIMITED  Dönemi :01.01.2026...
-        line N:   Müşteri Adı / Ünvanı :
-        line N+1: SIRKETI
-        line N+2: TCKN / VKN :7600928****
-
-    So we collect:
-      * the line above the label (stripping right-column garbage)
-      * lines below the label until we hit the next field label
-    """
     lines = text.split('\n')
+    for line in lines:
+        m = re.search(r'Müşteri Adı\s*/\s*Ünvanı\s*:\s*(.+)', line)
+        if m:
+            name = m.group(1).strip()
+            if name:
+                return name
+
     label_idx = next(
-        (i for i, l in enumerate(lines) if 'Müşteri Adı / Ünvanı' in l),
-        None,
-    )
+        (i for i, l in enumerate(lines) if 'Müşteri Adı / Ünvanı' in l), None)
     if label_idx is None:
         return ''
 
     next_label_re = re.compile(r'^(TCKN|Hesap|Bakiye|Şube|Döviz|IBAN|Bloke|Toplam)\b')
     parts: list[str] = []
-
-    # Line above the label — likely the first line of the name
     if label_idx > 0:
         cand = _hb_strip_right_column(lines[label_idx - 1]).strip()
-        # Skip if it's actually a different label (e.g. "Müşteri Numarası : ...")
         if cand and not cand.startswith(('Müşteri', 'Hesap', 'TCKN', 'IBAN',
                                          'Şube', 'Döviz', 'Bakiye', 'Bloke',
-                                         'Kullanıl', 'Toplam', 'Üretim', 'Dönemi')):
+                                         'Kullanıl', 'Toplam', 'Üretim', 'Dönemi',
+                                         'MÜŞTERİ', 'Dönem')):
             parts.append(cand)
-
-    # Lines below the label until next field
     for j in range(label_idx + 1, min(label_idx + 5, len(lines))):
         cand = _hb_strip_right_column(lines[j]).strip()
         if not cand:
@@ -228,14 +185,10 @@ def _hb_extract_customer_name(text: str) -> str:
         if next_label_re.match(cand):
             break
         parts.append(cand)
-
     return ' '.join(parts).strip()
 
 
 def _hb_extract_metadata(pdf_bytes: bytes) -> StatementMetadata:
-    """Extract cover-page metadata from page 1 (no cropping — pdfplumber's
-    text ordering on cropped regions is unreliable for this layout).
-    """
     md = StatementMetadata(bank='HALKBANK')
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
@@ -243,7 +196,6 @@ def _hb_extract_metadata(pdf_bytes: bytes) -> StatementMetadata:
     except Exception:
         return md
 
-    # Strip right-column garbage from each line before regex matching
     cleaned_lines = [_hb_strip_right_column(l) for l in text.split('\n')]
     cleaned = '\n'.join(cleaned_lines)
 
@@ -251,34 +203,39 @@ def _hb_extract_metadata(pdf_bytes: bytes) -> StatementMetadata:
         m = re.search(pattern, source)
         return m.group(1).strip() if m else None
 
-    md.customer_no   = grab(r'Müşteri Numarası\s*:\s*(\S+)') or ''
+    md.customer_no = grab(r'Müşteri Numarası\s*:\s*(\S+)') or grab(r'Müşteri No\s*:\s*(\S+)') or ''
     md.customer_name = _hb_extract_customer_name(text)
-    md.account_no    = grab(r'Hesap No\s*:\s*(\S+)') or ''
-    md.iban          = grab(r'IBAN\s*:\s*(\S+)') or ''
-    md.branch        = grab(r'Şube Kodu / Adı\s*:\s*([^\n]+)') or ''
-    md.currency      = grab(r'Döviz Cinsi\s*:\s*(\S+)') or ''
-
-    # Period and stated balance live in the right column — search RAW text
-    period = grab(r'Dönemi\s*:\s*([\d./]+\s*-\s*[\d./]+)', source=text)
+    md.account_no = grab(r'Hesap No\s*:\s*(\S+)') or ''
+    md.iban = grab(r'IBAN\s*:\s*(\S+)') or ''
+    md.branch = grab(r'Şube Kodu / Adı\s*:\s*([^\n]+)') or ''
+    if not md.branch:
+        code = grab(r'Şube Kodu\s*:\s*(\S+)') or ''
+        name = grab(r'Şube Adı\s*:\s*([^\n]+)') or ''
+        if code or name:
+            md.branch = f"{code} / {name}".strip(' /')
+    md.currency = grab(r'Döviz Cinsi\s*:\s*(\S+)') or ''
+    period = (
+        grab(r'Dönemi\s*:\s*([\d./]+\s*-\s*[\d./]+)', source=text) or
+        grab(r'Dönem\s*\(Tarih Aralığı\)\s*:\s*([\d./]+\s*-\s*[\d./]+)', source=text) or
+        grab(r'Dönem[^:]*:\s*([\d./]+\s*-\s*[\d./]+)', source=text)
+    )
     if period and '-' in period:
         a, b = period.split('-', 1)
         md.period_start, md.period_end = a.strip(), b.strip()
-
     bal = grab(r'Hesap Bakiyesi\s*:\s*([\-\d.,]+)', source=text)
     if bal:
         try:
             md.stated_balance = parse_tr_decimal(bal)
         except InvalidOperation:
             pass
-
     return md
 
 
+def _normalize_date(date_str: str) -> str:
+    return date_str.replace('.', '-')
+
+
 def _hb_parse_transactions(full_text: str) -> tuple[list[TransactionRow], list[str]]:
-    """Halkbank wraps long descriptions across multiple visual lines, breaking
-    mid-character. Continuation lines must be joined WITHOUT a separator so
-    that '...687' + '2' = '...6872' stays intact.
-    """
     rows: list[TransactionRow] = []
     warnings: list[str] = []
     current: Optional[TransactionRow] = None
@@ -293,7 +250,7 @@ def _hb_parse_transactions(full_text: str) -> tuple[list[TransactionRow], list[s
         if stripped in _HB_SKIP_EXACT:
             continue
 
-        m = _HB_ROW.match(line)
+        m = _HB_ROW_V1.match(line)
         if m:
             if current is not None:
                 rows.append(current)
@@ -305,51 +262,328 @@ def _hb_parse_transactions(full_text: str) -> tuple[list[TransactionRow], list[s
                 warnings.append(f"Skipped malformed row at {date_str}: {exc}")
                 current = None
                 continue
-            current = TransactionRow(
-                date=date_str,
-                amount=amount,
-                balance=balance,
-                description=desc.strip(),
-            )
-        else:
-            if current is None:
+            current = TransactionRow(date=date_str, amount=amount, balance=balance,
+                                     description=desc.strip())
+            continue
+
+        m2 = _HB_ROW_V2.match(line)
+        if m2:
+            if current is not None:
+                rows.append(current)
+            date_str, amount_str, amount_sign, balance_str, balance_sign, desc = m2.groups()
+            try:
+                amount = parse_tr_decimal(amount_str)
+                balance = parse_tr_decimal(balance_str)
+            except InvalidOperation as exc:
+                warnings.append(f"Skipped malformed row at {date_str}: {exc}")
+                current = None
                 continue
-            if stripped.startswith(_HB_SKIP_CONT_PREFIXES):
-                continue
-            current.description += stripped
+            if amount_sign == '-':
+                amount = -amount
+            if balance_sign == '-':
+                balance = -balance
+            current = TransactionRow(date=_normalize_date(date_str), amount=amount,
+                                     balance=balance, description=desc.strip())
+            continue
+
+        if current is None:
+            continue
+        if stripped.startswith(_HB_SKIP_CONT_PREFIXES):
+            continue
+        if stripped.startswith('Ekstrenize') or stripped.startswith('Türkiye Halk Bankası'):
+            continue
+        current.description += stripped
 
     if current is not None:
         rows.append(current)
-
     for r in rows:
         r.receipt = _hb_extract_dekont(r.description)
-
     return rows, warnings
 
 
 def parse_halkbank(pdf_bytes: bytes, full_text: str, source_filename: str) -> StatementResult:
     metadata = _hb_extract_metadata(pdf_bytes)
     rows, warnings = _hb_parse_transactions(full_text)
-    return StatementResult(
-        source_filename=source_filename,
-        metadata=metadata,
-        rows=rows,
-        parser_warnings=warnings,
-    )
+    return StatementResult(source_filename=source_filename, metadata=metadata,
+                           rows=rows, parser_warnings=warnings)
 
 
 # =============================================================================
-# 5. Parser registry
+# 5. Akbank parser
+# =============================================================================
+
+# Akbank row: dd.mm.yyyy HH:MM dd.mm.yyyy FISHNO AMOUNT BALANCE B/A DESC
+# Listed reverse-chronologically. Balance can be negative.
+_AK_NUM = r'-?[\d.]+,\d{2}'
+_AK_ROW = re.compile(
+    rf'^(\d{{2}}\.\d{{2}}\.\d{{4}})\s+'       # İşlem Tarihi
+    rf'(\d{{2}}:\d{{2}})\s+'                    # Saat
+    rf'\d{{2}}\.\d{{2}}\.\d{{4}}\s+'            # Valör (skip)
+    rf'(\d+)\s+'                                # Fiş No (DEKONT)
+    rf'({_AK_NUM})\s+'                          # Meblağ
+    rf'({_AK_NUM})\s+'                          # Bakiye
+    rf'([BA])\s+'                               # B/A
+    rf'(.*)$'                                   # Açıklama
+)
+
+_AK_SKIP_LINE_STARTS = (
+    'HESAP HAREKET', 'Tarih :', 'Düzenleyen', 'Hesap Şube', 'Hesap No',
+    'Döviz', 'TARİH', 'AKBANK',
+)
+
+
+def _ak_extract_metadata(pdf_bytes: bytes) -> StatementMetadata:
+    md = StatementMetadata(bank='AKBANK')
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            text = pdf.pages[0].extract_text() or ''
+    except Exception:
+        return md
+
+    def grab(pattern: str) -> Optional[str]:
+        m = re.search(pattern, text)
+        return m.group(1).strip() if m else None
+
+    md.customer_name = grab(r'Ad Soyad\s*:\s*([^\n]+)') or ''
+    md.account_no = grab(r'Hesap No\s*:\s*(\S+)') or ''
+    md.iban = grab(r'IBAN\s*:\s*(\S+)') or ''
+
+    # "Hesap Şube : 181 - İSTİNYE/İST." — may share line with other fields
+    branch_m = re.search(r'Hesap Şube\s*:\s*(.+?)(?:\s{2,}|\s+(?:IBAN|Ad Soyad|Tarih))', text)
+    md.branch = branch_m.group(1).strip() if branch_m else (grab(r'Hesap Şube\s*:\s*([^\n]+)') or '')
+
+    # "Döviz : 888 - TL"
+    curr = grab(r'Döviz\s*:\s*([^\n]+)')
+    if curr:
+        parts = curr.split('-')
+        md.currency = parts[-1].strip() if len(parts) > 1 else curr.strip()
+
+    period = grab(r'Tarih Aralığı\s*:\s*([\d./]+\s*-\s*[\d./]+)')
+    if period and '-' in period:
+        a, b = period.split('-', 1)
+        md.period_start, md.period_end = a.strip(), b.strip()
+
+    return md
+
+
+def _ak_parse_transactions(full_text: str) -> tuple[list[TransactionRow], list[str]]:
+    rows: list[TransactionRow] = []
+    warnings: list[str] = []
+    current: Optional[TransactionRow] = None
+
+    for raw in full_text.split('\n'):
+        line = raw.rstrip('\r').rstrip()
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        # Skip headers / footers / page numbers
+        if stripped.startswith(_AK_SKIP_LINE_STARTS):
+            continue
+        if re.match(r'^\d+\s*/\s*\d+$', stripped):
+            continue
+
+        m = _AK_ROW.match(line)
+        if m:
+            if current is not None:
+                rows.append(current)
+            date_str, time_str, fis_no, amount_str, balance_str, ba, desc = m.groups()
+            try:
+                amount = parse_tr_decimal(amount_str)
+                balance = parse_tr_decimal(balance_str)
+            except InvalidOperation as exc:
+                warnings.append(f"Skipped malformed row at {date_str}: {exc}")
+                current = None
+                continue
+            if ba == 'B':
+                amount = -abs(amount)
+            else:
+                amount = abs(amount)
+            current = TransactionRow(
+                date=_normalize_date(date_str), time=time_str,
+                amount=amount, balance=balance,
+                description=desc.strip(), receipt=fis_no,
+            )
+            continue
+
+        # Continuation line
+        if current is None:
+            continue
+        current.description += ' ' + stripped
+
+    if current is not None:
+        rows.append(current)
+
+    # Akbank lists newest-first; reverse to chronological (oldest-first)
+    rows.reverse()
+    return rows, warnings
+
+
+def parse_akbank(pdf_bytes: bytes, full_text: str, source_filename: str) -> StatementResult:
+    metadata = _ak_extract_metadata(pdf_bytes)
+    rows, warnings = _ak_parse_transactions(full_text)
+    return StatementResult(source_filename=source_filename, metadata=metadata,
+                           rows=rows, parser_warnings=warnings)
+
+
+# =============================================================================
+# 6. Generic fallback parser
+# =============================================================================
+
+_GEN_DATE = r'\d{2}[.\-/]\d{2}[.\-/]\d{4}'
+_GEN_TIME = r'\d{2}:\d{2}'
+_GEN_NUM = r'-?[\d.]+,\d{2}'
+
+_GEN_PATTERNS = [
+    # P1: date time valör fishno amount balance B/A desc (Akbank-like)
+    ('akbank_like', re.compile(
+        rf'^({_GEN_DATE})\s+({_GEN_TIME})\s+{_GEN_DATE}\s+\d+\s+'
+        rf'({_GEN_NUM})\s+({_GEN_NUM})\s+([BA])\s+(.*)$'
+    )),
+    # P2: date valör amount ± balance ± desc (Halkbank V2-like)
+    ('halkbank_v2_like', re.compile(
+        rf'^({_GEN_DATE})\s+{_GEN_DATE}\s+'
+        rf'([\d.]+,\d{{2}})\s+([+-])\s+'
+        rf'([\d.]+,\d{{2}})\s+([+-])\s+(.*)$'
+    )),
+    # P3: date signed-amount balance desc (Halkbank V1-like)
+    ('halkbank_v1_like', re.compile(
+        rf'^({_GEN_DATE})\s+({_GEN_NUM})\s+({_GEN_NUM})\s+(.*)$'
+    )),
+]
+
+_GEN_SKIP_STARTS = (
+    'HESAP', 'TARİH', 'TARIH', 'İŞLEM', 'SAYFA', 'AKBANK', 'HALKBANK',
+    'GARANTİ', 'ZİRAAT', 'MÜŞTERİ', 'MUSTERI', 'IBAN', 'DÖVIZ', 'DOVIZ',
+    'DÜZENLEYEN', 'ŞUBE', 'SUBE', 'DÖNEM', 'DONEM', 'TCKN', 'Müşteri',
+    'Hesap', 'Şube', 'Döviz', 'Dönem', 'Bakiye', 'Bloke', 'Toplam',
+    'Türkiye', 'Ekstrenize', 'yerine',
+)
+
+
+def _generic_parse_transactions(full_text: str) -> tuple[list[TransactionRow], list[str]]:
+    rows: list[TransactionRow] = []
+    warnings: list[str] = []
+    current: Optional[TransactionRow] = None
+
+    for raw in full_text.split('\n'):
+        line = raw.rstrip('\r').rstrip()
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        matched = False
+        for pat_name, pat_re in _GEN_PATTERNS:
+            m = pat_re.match(line)
+            if not m:
+                continue
+            if current is not None:
+                rows.append(current)
+
+            groups = m.groups()
+            if pat_name == 'akbank_like':
+                date_str, time_str, amount_str, balance_str, ba, desc = groups
+                try:
+                    amount = parse_tr_decimal(amount_str)
+                    balance = parse_tr_decimal(balance_str)
+                except InvalidOperation:
+                    current = None
+                    matched = True
+                    break
+                if ba == 'B':
+                    amount = -abs(amount)
+                else:
+                    amount = abs(amount)
+                current = TransactionRow(date=_normalize_date(date_str), time=time_str,
+                                         amount=amount, balance=balance, description=desc.strip())
+            elif pat_name == 'halkbank_v2_like':
+                date_str, amount_str, amount_sign, balance_str, balance_sign, desc = groups
+                try:
+                    amount = parse_tr_decimal(amount_str)
+                    balance = parse_tr_decimal(balance_str)
+                except InvalidOperation:
+                    current = None
+                    matched = True
+                    break
+                if amount_sign == '-':
+                    amount = -amount
+                if balance_sign == '-':
+                    balance = -balance
+                current = TransactionRow(date=_normalize_date(date_str), amount=amount,
+                                         balance=balance, description=desc.strip())
+            elif pat_name == 'halkbank_v1_like':
+                date_str, amount_str, balance_str, desc = groups
+                try:
+                    amount = parse_tr_decimal(amount_str)
+                    balance = parse_tr_decimal(balance_str)
+                except InvalidOperation:
+                    current = None
+                    matched = True
+                    break
+                current = TransactionRow(date=_normalize_date(date_str), amount=amount,
+                                         balance=balance, description=desc.strip())
+            matched = True
+            break
+
+        if not matched and current is not None:
+            if any(stripped.upper().startswith(s.upper()) for s in _GEN_SKIP_STARTS):
+                continue
+            if re.match(r'^\d+\s*/\s*\d+$', stripped):
+                continue
+            current.description += ' ' + stripped
+
+    if current is not None:
+        rows.append(current)
+    return rows, warnings
+
+
+def parse_generic(pdf_bytes: bytes, full_text: str, source_filename: str) -> StatementResult:
+    md = StatementMetadata(bank='UNKNOWN')
+    def grab(pattern: str) -> Optional[str]:
+        m = re.search(pattern, full_text[:3000])
+        return m.group(1).strip() if m else None
+
+    md.customer_name = grab(r'(?:Ad Soyad|Müşteri Adı|Ünvanı?)\s*:\s*([^\n]+)') or ''
+    md.account_no = grab(r'Hesap No\s*:\s*(\S+)') or ''
+    md.iban = grab(r'IBAN\s*:\s*(\S+)') or ''
+    period = grab(r'(?:Tarih Aralığı|Dönemi?|Dönem)\s*[:(]\s*([\d./]+\s*-\s*[\d./]+)')
+    if period and '-' in period:
+        a, b = period.split('-', 1)
+        md.period_start, md.period_end = a.strip(), b.strip()
+
+    rows, warnings = _generic_parse_transactions(full_text)
+    warnings.insert(0,
+        "⚠ Used generic fallback parser — bank not recognized. "
+        "Results may be incomplete. Please verify carefully."
+    )
+
+    # Auto-detect reverse chronological order and fix
+    if len(rows) >= 2:
+        try:
+            first_d = pd.to_datetime(rows[0].date, format='%d-%m-%Y', errors='coerce')
+            last_d = pd.to_datetime(rows[-1].date, format='%d-%m-%Y', errors='coerce')
+            if first_d is not None and last_d is not None and first_d > last_d:
+                rows.reverse()
+                warnings.append("Rows appeared reverse-chronological; reversed to oldest-first.")
+        except Exception:
+            pass
+
+    return StatementResult(source_filename=source_filename, metadata=md,
+                           rows=rows, parser_warnings=warnings)
+
+
+# =============================================================================
+# 7. Parser registry
 # =============================================================================
 
 PARSERS: dict[str, Callable[[bytes, str, str], StatementResult]] = {
     'HALKBANK': parse_halkbank,
-    # TODO: 'AKBANK': parse_akbank — different layout (has Saat & DEKONT columns)
+    'AKBANK': parse_akbank,
 }
 
 
 # =============================================================================
-# 6. Validation
+# 8. Validation
 # =============================================================================
 
 def validate_balance_chain(rows: list[TransactionRow]) -> list[BalanceIssue]:
@@ -358,10 +592,8 @@ def validate_balance_chain(rows: list[TransactionRow]) -> list[BalanceIssue]:
         expected = rows[i - 1].balance + rows[i].amount
         if expected != rows[i].balance:
             issues.append(BalanceIssue(
-                row_index=i,
-                date=rows[i].date,
-                expected=expected,
-                actual=rows[i].balance,
+                row_index=i, date=rows[i].date,
+                expected=expected, actual=rows[i].balance,
                 diff=rows[i].balance - expected,
             ))
     return issues
@@ -374,7 +606,7 @@ def validate_final_balance(result: StatementResult) -> Optional[bool]:
 
 
 # =============================================================================
-# 7. PDF text extraction
+# 9. PDF text extraction
 # =============================================================================
 
 def extract_pdf_text(pdf_bytes: bytes) -> str:
@@ -386,47 +618,39 @@ def extract_pdf_text(pdf_bytes: bytes) -> str:
 
 
 # =============================================================================
-# 8. Pipeline
+# 10. Pipeline
 # =============================================================================
 
 def process_pdf(pdf_bytes: bytes, filename: str) -> StatementResult:
     text = extract_pdf_text(pdf_bytes)
     bank = detect_bank(text)
 
-    if bank is None:
-        result = StatementResult(source_filename=filename, metadata=StatementMetadata())
-        result.parser_warnings.append(
-            "Unrecognized bank. Currently supported: " + ", ".join(PARSERS.keys())
+    if bank is not None and bank in PARSERS:
+        result = PARSERS[bank](pdf_bytes, text, filename)
+    elif bank is not None:
+        result = parse_generic(pdf_bytes, text, filename)
+        result.metadata.bank = bank
+        result.parser_warnings.insert(0,
+            f"Detected {bank} but no dedicated parser. Using generic fallback."
         )
-        return result
+    else:
+        result = parse_generic(pdf_bytes, text, filename)
 
-    if bank not in PARSERS:
-        result = StatementResult(source_filename=filename,
-                                 metadata=StatementMetadata(bank=bank))
-        result.parser_warnings.append(
-            f"Detected {bank} but no parser is implemented yet. "
-            f"Currently implemented: {', '.join(PARSERS.keys())}."
-        )
-        return result
-
-    result = PARSERS[bank](pdf_bytes, text, filename)
     result.balance_issues = validate_balance_chain(result.rows)
     result.final_balance_match = validate_final_balance(result)
     return result
 
 
 # =============================================================================
-# 9. Output
+# 11. Output
 # =============================================================================
 
-# Per user spec — only these six columns.
 OUTPUT_COLUMNS = ['TARİH', 'Saat', 'TUTAR', 'Bakiye', 'AÇIKLAMA', 'DEKONT']
 
 
 def result_to_dataframe(result: StatementResult) -> pd.DataFrame:
     if not result.rows:
         return pd.DataFrame(columns=OUTPUT_COLUMNS)
-
     df = pd.DataFrame({
         'TARİH':    [r.date for r in result.rows],
         'Saat':     [r.time for r in result.rows],
@@ -440,25 +664,14 @@ def result_to_dataframe(result: StatementResult) -> pd.DataFrame:
 
 
 def df_to_xlsx_bytes(df: pd.DataFrame) -> bytes:
-    """Use openpyxl — pandas' default xlsx engine, no extra install needed
-    beyond pandas itself in most setups.
-
-    Important: DEKONT contains long numeric-looking strings with leading zeros
-    (e.g. '000001813395187'). We force that column to text format so Excel
-    doesn't reinterpret it as a float and show '1.81E+09'.
-    """
     from openpyxl.utils import get_column_letter
-
-    # Make sure DEKONT is stored as string with leading zeros preserved
     df = df.copy()
     if 'DEKONT' in df.columns:
         df['DEKONT'] = df['DEKONT'].astype(str).replace({'nan': '', 'None': ''})
-
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine='openpyxl') as writer:
         df.to_excel(writer, sheet_name='Hareketler', index=False)
         ws = writer.sheets['Hareketler']
-
         for i, col in enumerate(df.columns, start=1):
             try:
                 sample = df[col].astype(str)
@@ -466,23 +679,16 @@ def df_to_xlsx_bytes(df: pd.DataFrame) -> bytes:
             except Exception:
                 width = 18
             ws.column_dimensions[get_column_letter(i)].width = width
-
-        # Money formatting for TUTAR / Bakiye
         for col_name in ('TUTAR', 'Bakiye'):
             if col_name in df.columns:
                 col_letter = get_column_letter(df.columns.get_loc(col_name) + 1)
                 for row_idx in range(2, len(df) + 2):
                     ws[f'{col_letter}{row_idx}'].number_format = '#,##0.00'
-
-        # CRITICAL: force DEKONT to text format. The values are numeric-looking
-        # strings with leading zeros like '000001813395187' — without this,
-        # Excel reads them as floats and shows '1.81E+09', destroying the data.
         if 'DEKONT' in df.columns:
             col_letter = get_column_letter(df.columns.get_loc('DEKONT') + 1)
             for row_idx in range(2, len(df) + 2):
                 cell = ws[f'{col_letter}{row_idx}']
                 cell.number_format = '@'
-                # Also force the value itself to be a string
                 if cell.value is not None and cell.value != '':
                     cell.value = str(cell.value)
     return buf.getvalue()
@@ -493,7 +699,7 @@ def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
 
 
 # =============================================================================
-# 10. Filename
+# 12. Filename
 # =============================================================================
 
 _SAFE_RE = re.compile(r'[^A-Za-z0-9._\-]+')
@@ -513,7 +719,7 @@ def build_output_basename(result: StatementResult) -> str:
 
 
 # =============================================================================
-# 11. Upload handling (PDF + ZIP)
+# 13. Upload handling (PDF + ZIP)
 # =============================================================================
 
 def iter_uploaded(uploaded_files) -> list[tuple[str, bytes]]:
@@ -538,7 +744,7 @@ def iter_uploaded(uploaded_files) -> list[tuple[str, bytes]]:
 
 
 # =============================================================================
-# 12. Streamlit UI
+# 14. Streamlit UI
 # =============================================================================
 
 def render_metadata(md: StatementMetadata) -> None:
@@ -605,7 +811,8 @@ def main() -> None:
     st.title("Bank Statement → Excel/CSV")
     st.caption(
         "Accountant-grade extraction for Turkish bank PDFs. "
-        "Currently supports: " + ", ".join(PARSERS.keys()) + "."
+        "Supported: " + ", ".join(PARSERS.keys()) + ". "
+        "Other banks: generic fallback parser."
     )
 
     if 'results' not in st.session_state:
