@@ -218,36 +218,118 @@ def _fix_ocr_date(s: str) -> str:
 # 3. Bank detection
 # =============================================================================
 
-def detect_bank(full_text: str) -> Optional[str]:
-    """Detect issuing bank by looking at the statement header (first ~500 chars
-    where the bank logo / brand sits). This avoids false positives when one
-    bank's name appears inside another bank's transaction descriptions
-    (e.g. a Ziraat statement that mentions 'Türkiye Garanti Bankası' as a
-    FAST-transfer destination)."""
-    def _check(window: str) -> Optional[str]:
-        # Order doesn't matter much within the header — only one bank's brand
-        # should appear there. We still keep it stable for predictability.
-        if 'ZİRAAT' in window or 'ZIRAAT BANKASI' in window or 'ZIRAAT' in window:
-            return 'ZIRAAT'
-        if 'AKBANK' in window or 'AKPOS' in window:
-            return 'AKBANK'
-        if 'HALKBANK' in window or 'TÜRKIYE HALK BANKASI' in window or 'TURKIYE HALK BANKASI' in window:
-            return 'HALKBANK'
-        if 'GARANTİ' in window or 'GARANTI BANKASI' in window:
-            return 'GARANTI'
-        if 'İŞ BANKASI' in window or 'IS BANKASI' in window or 'TÜRKİYE İŞ BANKASI' in window:
-            return 'ISBANK'
-        if 'YAPI VE KREDİ' in window or 'YAPI KREDI' in window:
-            return 'YAPIKREDI'
-        return None
+# Turkish IBAN bank codes — positions 5-9 of the 26-char TR IBAN.
+# Only includes banks where statements have been observed; extending this
+# table is the primary way to add support for a new bank.
+_IBAN_BANK_CODES: dict[str, str] = {
+    '00010': 'ZIRAAT',     # Türkiye Cumhuriyeti Ziraat Bankası
+    '00012': 'HALKBANK',   # Türkiye Halk Bankası
+    '00015': 'VAKIFBANK',  # Türkiye Vakıflar Bankası
+    '00032': 'TEB',        # Türk Ekonomi Bankası
+    '00046': 'AKBANK',
+    '00062': 'GARANTI',    # Garanti BBVA / Türkiye Garanti Bankası
+    '00064': 'ISBANK',     # Türkiye İş Bankası
+    '00067': 'YAPIKREDI',  # Yapı ve Kredi Bankası
+    '00111': 'QNB',        # QNB Finansbank
+    '00134': 'DENIZBANK',
+    '00203': 'ALBARAKA',   # Albaraka Türk
+    '00205': 'KUVEYTTURK', # Kuveyt Türk Katılım Bankası
+}
 
+
+def _extract_iban_bank_code(text: str) -> Optional[str]:
+    """Find the customer's IBAN in the metadata header (first ~2000 chars,
+    before the transaction table starts) and return the 5-digit bank code.
+
+    The regex requires positions 5-9 (the bank code) to be unmasked digits.
+    Mask characters elsewhere in the IBAN (****) are tolerated since banks
+    sometimes redact the account number portion.
+    """
+    head = text[:2000]
+    # Strict: 'IBAN' label, then TR + 2 check digits + 5 bank-code digits.
+    m = re.search(r'IBAN\s*[:\s]\s*TR\d{2}(\d{5})', head)
+    if m:
+        return m.group(1)
+    # Looser: any TR-IBAN in header (handles formats where 'IBAN' label
+    # uses a different separator or is OCR'd weirdly).
+    m = re.search(r'\bTR\d{2}(\d{5})\d', head)
+    if m:
+        return m.group(1)
+    return None
+
+
+def detect_bank(full_text: str) -> Optional[str]:
+    """Detect the issuing bank using a multi-signal approach:
+      1. Customer's IBAN bank code (most reliable — unique per bank,
+         lives in the metadata header, immune to transaction-text noise).
+      2. Scoring on header + body text signals (fallback when IBAN is
+         missing or masked too aggressively).
+    """
+    # Strongest signal first: IBAN bank code.
+    code = _extract_iban_bank_code(full_text)
+    if code and code in _IBAN_BANK_CODES:
+        return _IBAN_BANK_CODES[code]
+
+    # Fallback: scoring on text signals.
     upper = full_text.upper()
-    # Header-only detection first — strongly preferred.
-    head_hit = _check(upper[:500])
-    if head_hit:
-        return head_hit
-    # Fallback: scan a wider window, but accept that this is less reliable.
-    return _check(upper[:5000])
+    head = upper[:500]
+    body = upper[:8000]
+    scores: dict[str, int] = {}
+
+    def add(bank: str, points: int) -> None:
+        scores[bank] = scores.get(bank, 0) + points
+
+    # Halkbank
+    if 'HALKBANK' in head:
+        add('HALKBANK', 10)
+    if 'TÜRKIYE HALK BANKASI' in body or 'TURKIYE HALK BANKASI' in body:
+        add('HALKBANK', 8)
+    if 'HALKBANK.COM.TR' in body:
+        add('HALKBANK', 8)
+    if 'HALKBANK DIALOG' in body:
+        add('HALKBANK', 6)
+    if 'MÜŞTERI BILGILERINIZ' in body or 'MÜŞTERİ BİLGİLERİNİZ' in body:
+        add('HALKBANK', 4)
+
+    # Akbank
+    if 'AKBANK' in head:
+        add('AKBANK', 10)
+    if 'AKBANK T.A.S' in body or 'AKBANK T.A.Ş' in body:
+        add('AKBANK', 8)
+    if 'AKPOS' in body:
+        add('AKBANK', 4)
+
+    # Ziraat — only count strong header signals, NOT mid-text Ziraat refs
+    # which appear constantly in transaction descriptions of OTHER banks
+    # (transfers to/from Ziraat accounts).
+    if 'ZIRAAT BANKASI' in head or 'ZİRAAT BANKASI' in head:
+        add('ZIRAAT', 10)
+    if 'T.C. ZIRAAT' in head or 'T.C. ZİRAAT' in head:
+        add('ZIRAAT', 10)
+    if 'ZIRAATBANK.COM.TR' in body:
+        add('ZIRAAT', 8)
+
+    # Garanti BBVA
+    if 'GARANTI BBVA' in body or 'GARANTİ BBVA' in body:
+        add('GARANTI', 10)
+    if 'GARANTI BANKASI' in head or 'GARANTİ BANKASI' in head:
+        add('GARANTI', 10)
+
+    # Yapı Kredi
+    if 'YAPI VE KREDI' in head or 'YAPI KREDI' in head or 'YAPIKREDI' in head:
+        add('YAPIKREDI', 10)
+
+    # İş Bankası
+    if 'İŞ BANKASI' in head or 'IS BANKASI' in head or 'TÜRKİYE İŞ BANKASI' in head:
+        add('ISBANK', 10)
+
+    # Vakıfbank
+    if 'VAKIFBANK' in head or 'VAKIFLAR BANKASI' in head:
+        add('VAKIFBANK', 10)
+
+    if scores:
+        return max(scores.items(), key=lambda kv: kv[1])[0]
+    return None
 
 
 # =============================================================================
@@ -328,7 +410,12 @@ _HB_SKIP_CONT_PREFIXES = (
 _HB_SKIP_EXACT = {'HESAP ÖZETİ'}
 
 _HB_NUM = r'-?[\d.]+,\d{2}'
-_HB_ROW_V1 = re.compile(rf'^(\d{{2}}-\d{{2}}-\d{{4}})\s+({_HB_NUM})\s+({_HB_NUM})\s+(.*)$')
+# Allow ZERO whitespace between the date and a negative amount: some Halkbank
+# layouts render '30-04-2025-40.312,86' (the '-' of the amount glued to the
+# date). We use \s* between date and amount; the regex still disambiguates
+# correctly because \d{4} is non-greedy w.r.t. extra digits and the amount
+# starts with -? followed by [\d.]+,\d{2}.
+_HB_ROW_V1 = re.compile(rf'^(\d{{2}}-\d{{2}}-\d{{4}})\s*({_HB_NUM})\s+({_HB_NUM})\s+(.*)$')
 
 _HB_NUM_UNSIGNED = r'[\d.]+,\d{2}'
 _HB_ROW_V2 = re.compile(
