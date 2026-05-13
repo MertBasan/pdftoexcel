@@ -222,18 +222,28 @@ def _fix_ocr_date(s: str) -> str:
 # Only includes banks where statements have been observed; extending this
 # table is the primary way to add support for a new bank.
 _IBAN_BANK_CODES: dict[str, str] = {
-    '00010': 'ZIRAAT',     # Türkiye Cumhuriyeti Ziraat Bankası
-    '00012': 'HALKBANK',   # Türkiye Halk Bankası
-    '00015': 'VAKIFBANK',  # Türkiye Vakıflar Bankası
-    '00032': 'TEB',        # Türk Ekonomi Bankası
+    '00010': 'ZIRAAT',          # Türkiye Cumhuriyeti Ziraat Bankası
+    '00012': 'HALKBANK',        # Türkiye Halk Bankası
+    '00015': 'VAKIFBANK',       # Türkiye Vakıflar Bankası
+    '00032': 'TEB',             # Türk Ekonomi Bankası
     '00046': 'AKBANK',
-    '00062': 'GARANTI',    # Garanti BBVA / Türkiye Garanti Bankası
-    '00064': 'ISBANK',     # Türkiye İş Bankası
-    '00067': 'YAPIKREDI',  # Yapı ve Kredi Bankası
-    '00111': 'QNB',        # QNB Finansbank
+    '00059': 'SEKERBANK',       # Şekerbank
+    '00062': 'GARANTI',         # Garanti BBVA / Türkiye Garanti Bankası
+    '00064': 'ISBANK',          # Türkiye İş Bankası
+    '00067': 'YAPIKREDI',       # Yapı ve Kredi Bankası
+    '00099': 'INGBANK',         # ING Bank
+    '00103': 'FIBABANKA',       # Fibabanka
+    '00111': 'QNB',             # QNB Finansbank
+    '00123': 'HSBC',            # HSBC Bank
+    '00124': 'ALTERNATIF',      # Alternatifbank
+    '00125': 'BURGAN',          # Burgan Bank
     '00134': 'DENIZBANK',
-    '00203': 'ALBARAKA',   # Albaraka Türk
-    '00205': 'KUVEYTTURK', # Kuveyt Türk Katılım Bankası
+    '00146': 'ODEABANK',        # Odeabank
+    '00203': 'ALBARAKA',        # Albaraka Türk
+    '00205': 'KUVEYTTURK',      # Kuveyt Türk Katılım Bankası
+    '00206': 'TURKIYEFINANS',   # Türkiye Finans Katılım Bankası
+    '00209': 'VAKIFKATILIM',    # Vakıf Katılım Bankası
+    '00210': 'ZIRAATKATILIM',   # Ziraat Katılım Bankası
 }
 
 
@@ -241,18 +251,26 @@ def _extract_iban_bank_code(text: str) -> Optional[str]:
     """Find the customer's IBAN in the metadata header (first ~2000 chars,
     before the transaction table starts) and return the 5-digit bank code.
 
-    The regex requires positions 5-9 (the bank code) to be unmasked digits.
-    Mask characters elsewhere in the IBAN (****) are tolerated since banks
-    sometimes redact the account number portion.
+    Handles several real-world label variants:
+      'IBAN: TR84 0001 2 ...'
+      'IBAN :TR84000120012...'
+      'IBAN/Hesap No TR31002060...'   (slash-joined label)
+      'IBAN/Hesap No : TR82000670...'
     """
     head = text[:2000]
-    # Strict: 'IBAN' label, then TR + 2 check digits + 5 bank-code digits.
-    m = re.search(r'IBAN\s*[:\s]\s*TR\d{2}(\d{5})', head)
+    # Strip whitespace inside IBAN values (some banks render with spaces every 4 chars).
+    head_compact = re.sub(r'(TR\d{2})\s+', r'\1', head)
+    head_compact = re.sub(r'(\d{4})\s+(\d)', r'\1\2', head_compact)
+
+    # Strict: explicit IBAN label (any variant), then TR + check + 5-digit bank code.
+    m = re.search(
+        r'IBAN(?:\s*/\s*[\w\s]+?)?\s*[:\s]\s*TR\d{2}(\d{5})',
+        head_compact,
+    )
     if m:
         return m.group(1)
-    # Looser: any TR-IBAN in header (handles formats where 'IBAN' label
-    # uses a different separator or is OCR'd weirdly).
-    m = re.search(r'\bTR\d{2}(\d{5})\d', head)
+    # Looser: any TR-IBAN-like token in header.
+    m = re.search(r'\bTR\d{2}(\d{5})\d', head_compact)
     if m:
         return m.group(1)
     return None
@@ -979,6 +997,413 @@ def parse_ziraat(pdf_bytes: bytes, full_text: str, source_filename: str) -> Stat
 
 
 # =============================================================================
+# 7B. Yapı Kredi parser
+# =============================================================================
+#
+# Format characteristics:
+#   * Date column: DD/MM/YYYY (slashes)
+#   * Optional time column: HH:MM:SS
+#   * Amounts have ` TL` suffix; sign always glued to the digits (`-18.320,95 TL`)
+#   * Description sometimes wraps to lines PRECEDING the date row (when the
+#     Açıklama column has 2-3 lines of text, pdfplumber emits them just above
+#     the row that holds the date).
+#   * Statement is newest-first; we reverse to chronological at the end.
+
+_YK_DATE_RE = re.compile(r'^(\d{2}/\d{2}/\d{4})\b')
+_YK_ROW_RE = re.compile(
+    r'^(\d{2}/\d{2}/\d{4})\s+'                       # date
+    r'(?:(\d{2}:\d{2}:\d{2})\s+)?'                   # optional time
+    r'(.+?)\s+'                                       # description (reluctant)
+    r'(-?[\d.]+,\d{2})\s*TL\s+'                      # amount + TL
+    r'(-?[\d.]+,\d{2})\s*TL\s*$'                     # balance + TL
+)
+
+_YK_SKIP_PREFIXES = (
+    'Hesap Hareketleri', 'Müşteri Adı', 'Müşteri Numarası', 'Şube',
+    'Hesap Adı', 'IBAN', 'Kullanılabilir Bakiye', 'Tarih Aralığı',
+    'Tarih Saat', 'Tarih ', 'Yapı ve Kredi', 'www.yapikredi',
+    'Ticaret Sicil', 'Mersis No', 'İşletmenin Merkezi', 'Blok 34330',
+    'T: ', 'F: ',
+)
+
+
+def _yk_extract_metadata(text: str) -> StatementMetadata:
+    md = StatementMetadata(bank='YAPIKREDI')
+
+    def grab(pattern: str) -> Optional[str]:
+        m = re.search(pattern, text[:2000], re.IGNORECASE)
+        return m.group(1).strip() if m else None
+
+    md.customer_name = grab(r'Müşteri Adı(?:\s*Soyadı)?\s*:\s*([^\n]+)') or ''
+    md.customer_no = grab(r'Müşteri Numarası\s*:\s*([^\n]+)') or ''
+    md.branch = grab(r'Şube\s*:\s*([^\n]+)') or ''
+    md.iban = grab(r'IBAN(?:/Hesap No)?\s*:\s*(TR\S+)') or ''
+    md.currency = 'TL'  # YK shows "Vadesiz TL Hesabı" — always TRY in our test files
+    period = grab(r'Tarih Aralığı\s*:\s*(\d{2}/\d{2}/\d{4}\s*-\s*\d{2}/\d{2}/\d{4})')
+    if period and '-' in period:
+        a, b = period.split('-', 1)
+        md.period_start, md.period_end = a.strip(), b.strip()
+    return md
+
+
+def _yk_norm_date(s: str) -> str:
+    """13/05/2026 -> 13-05-2026."""
+    return s.replace('/', '-')
+
+
+def parse_yapikredi(pdf_bytes: bytes, full_text: str, source_filename: str) -> StatementResult:
+    metadata = _yk_extract_metadata(full_text)
+    rows: list[TransactionRow] = []
+    warnings: list[str] = []
+    pre_desc: list[str] = []
+
+    for raw in full_text.split('\n'):
+        line = raw.rstrip('\r').rstrip()
+        stripped = line.strip()
+        if not stripped:
+            pre_desc = []
+            continue
+        # Skip headers/footers
+        if any(stripped.startswith(p) for p in _YK_SKIP_PREFIXES):
+            pre_desc = []
+            continue
+
+        m = _YK_ROW_RE.match(stripped)
+        if m:
+            date_s, time_s, desc, amt_s, bal_s = m.groups()
+            try:
+                amount = parse_tr_decimal(amt_s)
+                balance = parse_tr_decimal(bal_s)
+            except (InvalidOperation, Exception) as exc:
+                warnings.append(f"Skipped Yapı Kredi row at {date_s}: {exc}")
+                pre_desc = []
+                continue
+            full_desc = ' '.join(pre_desc + [desc]).strip()
+            # Trim any trailing dashes that are description punctuation
+            # (e.g. 'GELEN FAST - Hakan Gecü -') so the desc reads cleanly.
+            full_desc = re.sub(r'\s+-\s*$', '', full_desc)
+            rows.append(TransactionRow(
+                date=_yk_norm_date(date_s), time=time_s or '',
+                amount=amount, balance=balance, description=full_desc,
+            ))
+            pre_desc = []
+        elif _YK_DATE_RE.match(stripped):
+            # Looks like a date row but didn't match — incomplete extraction.
+            warnings.append(f"Yapı Kredi: date row didn't match expected layout: {stripped[:120]!r}")
+            pre_desc = []
+        else:
+            # Continuation line (description spilled above the row)
+            pre_desc.append(stripped)
+
+    rows.reverse()  # statement is newest-first
+    return StatementResult(source_filename=source_filename, metadata=metadata,
+                           rows=rows, parser_warnings=warnings)
+
+
+# =============================================================================
+# 7C. Kuveyt Türk parser
+# =============================================================================
+#
+# Format characteristics:
+#   * Date column: DD.MM.YYYY (dots)
+#   * Reference code: 5-char uppercase alphanumeric (A6DJ0, A01PG, ASHSZ, ...)
+#   * Words in description often glued together: 'Gönderen:HakanGecü,Alıcı:GECO...'
+#     (PDF extraction artifact; we accept it as-is).
+#   * Tutar/Bakiye use Turkish comma decimals (e.g. 41.712,07).
+#   * NEGATIVE-SIGN QUIRK: when the negative amount is right-aligned in its
+#     column and wraps, the '-' character lands on the line ABOVE the date
+#     row, and the numeric value lands on the line BELOW it. So a single
+#     logical row may span 3 text lines:
+#         '-'
+#         '19.01.2026 A01PG <desc> 0,00'
+#         '41.712,07'
+#     where the actual amount is -41.712,07 and the balance on the date line
+#     (0,00) is the second column. We detect this by counting trailing
+#     numbers on the date row.
+#   * Statement is oldest-first → no reverse.
+
+_KT_NUM = r'-?\d{1,3}(?:\.\d{3})*,\d{2}|-?\d+,\d{2}'
+_KT_DATE_REF_RE = re.compile(
+    rf'^(\d{{2}}\.\d{{2}}\.\d{{4}})\s+([A-Z0-9]{{4,8}})\s+(.+)$'
+)
+# Description may be empty (entire desc was on lines ABOVE this date row).
+_KT_TWO_NUMS_TAIL = re.compile(rf'^(.*?)\s*({_KT_NUM})\s+({_KT_NUM})\s*$')
+_KT_ONE_NUM_TAIL  = re.compile(rf'^(.*?)\s*({_KT_NUM})\s*$')
+_KT_BARE_NUM_RE = re.compile(rf'^({_KT_NUM})\s*$')
+_KT_BARE_DASH_RE = re.compile(r'^-\s*$')
+
+_KT_SKIP_PREFIXES = (
+    'Hesap Bilgileri', 'HesapBilgileri', 'IBAN', 'Döviz', 'DövizTürü',
+    'Dönem', 'Hesap', 'Toplam', 'Sayın', 'HESAP ÖZETİ', 'HESAPÖZETİ',
+    'Oluşturulduğu', 'KUVEYT', 'Büyükdere', 'Ticaret', 'Mersis',
+    'İşlem', 'Açıklama', 'Devir', 'Tarihi', 'Referans',
+    'www.kuveytturk', 'Bakiyesi',
+)
+
+
+def _kt_extract_metadata(text: str) -> StatementMetadata:
+    md = StatementMetadata(bank='KUVEYTTURK')
+
+    def grab(pattern: str) -> Optional[str]:
+        m = re.search(pattern, text[:2500], re.IGNORECASE)
+        return m.group(1).strip() if m else None
+
+    md.customer_name = grab(r'Sayın\s+([A-ZÇĞİÖŞÜ][^\n]+?)(?:\s*$|\n)') or ''
+    md.account_no = grab(r'Hesap\s*Bilgileri\s*:\s*(\S+)') or ''
+    # IBAN may contain spaces every 4 chars — collapse
+    iban = grab(r'IBAN\s*:\s*(TR[\d\s]+)') or ''
+    md.iban = re.sub(r'\s+', '', iban) if iban else ''
+    period = grab(r'Dönem\s*:\s*(\d{2}\.\d{2}\.\d{4}\s*[\u2013\-]\s*\d{2}\.\d{2}\.\d{4})')
+    if period:
+        parts = re.split(r'\s*[\u2013\-]\s*', period, maxsplit=1)
+        if len(parts) == 2:
+            md.period_start, md.period_end = parts[0].strip(), parts[1].strip()
+    md.currency = 'TL'
+    return md
+
+
+def parse_kuveytturk(pdf_bytes: bytes, full_text: str, source_filename: str) -> StatementResult:
+    metadata = _kt_extract_metadata(full_text)
+    rows: list[TransactionRow] = []
+    warnings: list[str] = []
+
+    raw_lines = [l.strip() for l in full_text.split('\n')]
+    lines: list[str] = [l for l in raw_lines if l]  # drop empties for sequential lookup
+
+    i = 0
+    pre_desc: list[str] = []
+    pending_negative = False
+    while i < len(lines):
+        line = lines[i]
+
+        if _KT_BARE_DASH_RE.match(line):
+            pending_negative = True
+            i += 1
+            continue
+
+        if any(line.startswith(p) for p in _KT_SKIP_PREFIXES):
+            pre_desc = []
+            pending_negative = False
+            i += 1
+            continue
+
+        m = _KT_DATE_REF_RE.match(line)
+        if not m:
+            # Continuation description line BEFORE the date row
+            pre_desc.append(line)
+            i += 1
+            continue
+
+        date_s, ref, rest = m.groups()
+        amount: Optional[Decimal] = None
+        balance: Optional[Decimal] = None
+        desc_inline = ''
+
+        # Case A: date line ends with two numbers → amount + balance in-line.
+        two = _KT_TWO_NUMS_TAIL.match(rest)
+        if two:
+            desc_inline = two.group(1)
+            try:
+                amount = parse_tr_decimal(two.group(2))
+                balance = parse_tr_decimal(two.group(3))
+            except (InvalidOperation, Exception) as exc:
+                warnings.append(f"Kuveyt Türk: bad numbers at {date_s}: {exc}")
+                pre_desc = []; pending_negative = False; i += 1
+                continue
+            # If we already saw a standalone '-' on the previous line, the amount
+            # in this 2-number form is sometimes still meant to be negative —
+            # but only when the amount itself has no glued sign. Keep simple:
+            # trust the sign embedded in the number.
+        else:
+            # Case B: date line ends with ONE number → that's the BALANCE.
+            # The AMOUNT is on the next line (with sign on a line before date).
+            one = _KT_ONE_NUM_TAIL.match(rest)
+            if one and i + 1 < len(lines) and _KT_BARE_NUM_RE.match(lines[i + 1]):
+                desc_inline = one.group(1)
+                try:
+                    balance = parse_tr_decimal(one.group(2))
+                    amount = parse_tr_decimal(lines[i + 1])
+                except (InvalidOperation, Exception) as exc:
+                    warnings.append(f"Kuveyt Türk: bad numbers at {date_s}: {exc}")
+                    pre_desc = []; pending_negative = False; i += 2
+                    continue
+                if pending_negative:
+                    amount = -amount
+                i += 1  # consume the amount line
+            else:
+                warnings.append(
+                    f"Kuveyt Türk: couldn't parse row at {date_s}: {line[:120]!r}"
+                )
+                pre_desc = []; pending_negative = False; i += 1
+                continue
+
+        full_desc = ' '.join(pre_desc + [desc_inline]).strip()
+        # Strip trailing standalone '-' (the visual negative sign that got
+        # captured into the description column when sign was on a same line).
+        full_desc = re.sub(r'\s+-\s*$', '', full_desc)
+
+        rows.append(TransactionRow(
+            date=_normalize_date(date_s),
+            amount=amount, balance=balance,
+            description=full_desc, receipt=ref,
+        ))
+        pre_desc = []
+        pending_negative = False
+        i += 1
+
+    return StatementResult(source_filename=source_filename, metadata=metadata,
+                           rows=rows, parser_warnings=warnings)
+
+
+# =============================================================================
+# 7D. Türkiye Finans Katılım parser
+# =============================================================================
+#
+# Format characteristics:
+#   * Date: 'D.MM.YYYY' — single-digit day allowed (no leading zero!)
+#   * Reference: 5-char uppercase alphanumeric (XAQ5D, XK2PX, ...)
+#   * Amounts in ENGLISH format: period decimal, 4 decimal places, NO thousands
+#     separator: '-11171.9600 0.0000'.
+#   * Multi-column wrap: the 'İşlem' column ('Diğer Bankacılık İşlemleri') and
+#     the 'Açıklama' column each wrap to their own continuation lines. The
+#     first line of a transaction contains date+ref+partial-fields+amount+balance.
+#     Continuation lines below contain the rest of those fields, interleaved.
+#     We accept the messy description and validate via balance chain.
+#   * Statement is newest-first → reverse to chronological.
+
+_TF_NUM = r'-?\d+\.\d{2,4}'
+_TF_FIRST_LINE = re.compile(
+    rf'^(\d{{1,2}}\.\d{{1,2}}\.\d{{4}})\s+'    # date
+    rf'(\S+)\s+'                                # ref
+    rf'(.+?)\s+'                                 # middle text (reluctant)
+    rf'({_TF_NUM})\s+'                          # amount
+    rf'({_TF_NUM})\s*$'                          # balance
+)
+_TF_DATE_PREFIX = re.compile(r'^\d{1,2}\.\d{1,2}\.\d{4}\s')
+
+_TF_SKIP_PREFIXES = (
+    'Hesap Hareketleri', 'Müşteri', 'Döviz', 'Şube', 'Hesap Adı',
+    'IBAN', 'Kullanılabilir Bakiye', 'Tarih Aralığı',
+    'Tarih İşlem', 'Tarih ',
+)
+
+
+def _tf_extract_metadata(text: str) -> StatementMetadata:
+    md = StatementMetadata(bank='TURKIYEFINANS')
+
+    def grab(pattern: str) -> Optional[str]:
+        m = re.search(pattern, text[:2000], re.IGNORECASE)
+        return m.group(1).strip() if m else None
+
+    md.customer_name = grab(r'Müşteri Adı Soyadı\s+([^\n]+?)(?:\s*$|\n)') or ''
+    md.customer_no = grab(r'Müşteri Numarası\s+([^\n]+?)(?:\s*$|\n)') or ''
+    md.branch = grab(r'Şube\s+([^\n]+?)(?:\s*$|\n)') or ''
+    md.iban = grab(r'IBAN(?:/Hesap No)?\s+(TR\S+)') or ''
+    md.currency = grab(r'Döviz Cinsi\s+(\S+)') or 'TL'
+    period = grab(r'Tarih Aralığı\s+(\d{2}\.\d{2}\.\d{4}\s*-\s*\d{2}\.\d{2}\.\d{4})')
+    if period and '-' in period:
+        a, b = period.split('-', 1)
+        md.period_start, md.period_end = a.strip(), b.strip()
+    return md
+
+
+def _tf_norm_date(s: str) -> str:
+    """1.04.2026 or 01.04.2026 -> 01-04-2026."""
+    parts = s.split('.')
+    if len(parts) == 3:
+        try:
+            return f'{int(parts[0]):02d}-{int(parts[1]):02d}-{parts[2]}'
+        except ValueError:
+            pass
+    return s
+
+
+def parse_turkiyefinans(pdf_bytes: bytes, full_text: str, source_filename: str) -> StatementResult:
+    metadata = _tf_extract_metadata(full_text)
+    rows: list[TransactionRow] = []
+    warnings: list[str] = []
+
+    lines = full_text.split('\n')
+    # First pass: find rows that match the date+ref+amount+balance pattern.
+    # Continuation lines are appended to the previous row's description until
+    # the next date-prefixed line is seen.
+    current_row: Optional[TransactionRow] = None
+    pending_desc_extra: list[str] = []
+
+    def _flush_current() -> None:
+        nonlocal current_row, pending_desc_extra
+        if current_row is not None:
+            if pending_desc_extra:
+                extras = ' '.join(s for s in pending_desc_extra if s)
+                current_row.description = (
+                    f'{current_row.description} {extras}'.strip()
+                )
+            rows.append(current_row)
+        current_row = None
+        pending_desc_extra = []
+
+    for raw in lines:
+        line = raw.rstrip('\r').rstrip()
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if any(stripped.startswith(p) for p in _TF_SKIP_PREFIXES):
+            _flush_current()
+            continue
+
+        m = _TF_FIRST_LINE.match(stripped)
+        if m:
+            _flush_current()
+            date_s, ref, desc_part, amt_s, bal_s = m.groups()
+            try:
+                amount = Decimal(amt_s)
+                balance = Decimal(bal_s)
+            except (InvalidOperation, Exception) as exc:
+                warnings.append(f"Türkiye Finans: bad numbers at {date_s}: {exc}")
+                continue
+            current_row = TransactionRow(
+                date=_tf_norm_date(date_s),
+                amount=amount, balance=balance,
+                description=desc_part.strip(), receipt=ref,
+            )
+            continue
+
+        # Not a transaction-start line.
+        if _TF_DATE_PREFIX.match(stripped):
+            # Starts with date but the full pattern didn't match — log & skip.
+            warnings.append(
+                f"Türkiye Finans: date line failed pattern: {stripped[:120]!r}"
+            )
+            _flush_current()
+            continue
+
+        # Continuation of current row's description (or noise we'll discard
+        # if there's no current row).
+        if current_row is not None:
+            pending_desc_extra.append(stripped)
+
+    _flush_current()
+    rows.reverse()  # newest-first → chronological
+
+    # Clean up descriptions: drop the constant "Diğer Bankacılık İşlemleri"
+    # category prefix tokens that get interleaved with the description.
+    for r in rows:
+        d = r.description
+        # Remove "Diğer", "Bankacılık", "İşlemleri" boilerplate tokens with
+        # only whitespace between them, anywhere in the string.
+        d = re.sub(r'\bDiğer\s+Bankacılık\s+İşlemleri\b', '', d)
+        # Also strip these tokens individually if they're standalone (the
+        # PDF interleaves them column-wise so we sometimes see them alone).
+        d = re.sub(r'\b(Diğer|Bankacılık|İşlemleri)\b', '', d)
+        # Collapse whitespace.
+        d = re.sub(r'\s+', ' ', d).strip()
+        r.description = d
+
+    return StatementResult(source_filename=source_filename, metadata=metadata,
+                           rows=rows, parser_warnings=warnings)
+
+
+# =============================================================================
 # 8. Generic fallback parser  (unchanged from original)
 # =============================================================================
 
@@ -1069,6 +1494,108 @@ def _generic_parse_transactions(full_text: str) -> tuple[list[TransactionRow], l
     return rows, warnings
 
 
+def _generic_block_parse(full_text: str) -> tuple[list[TransactionRow], list[str]]:
+    """Block-accumulation fallback for unknown banks.
+
+    Strategy: many bank statements have rows that wrap to multiple lines due
+    to long descriptions. We scan for lines beginning with a date and end
+    the current block when we hit either (a) the next date-prefixed line,
+    or (b) end of text. From each block we try to extract trailing
+    'amount + balance' (Turkish-decimal pairs) and treat the rest as
+    description.
+
+    Tries both Turkish (`1.234,56`) and English (`1234.56` / `1234.5600`)
+    decimal formats, with optional `TL` / `TRY` suffix.
+
+    Returns rows in their original order from the PDF — the caller decides
+    whether to reverse.
+    """
+    # Date prefix variants — most TR statements use one of these.
+    date_prefix_re = re.compile(
+        r'^(\d{1,2}[./-]\d{1,2}[./-]\d{4})\b'
+    )
+    # Trailing amount + balance patterns, tried in order.
+    tail_patterns = [
+        # Turkish decimals with TL/TRY suffix
+        re.compile(r'(-?[\d.]+,\d{2})\s*(?:TL|TRY)\s+(-?[\d.]+,\d{2})\s*(?:TL|TRY)\s*$'),
+        # Turkish decimals plain
+        re.compile(r'(-?[\d.]+,\d{2})\s+(-?[\d.]+,\d{2})\s*$'),
+        # English decimals (2-4 dp)
+        re.compile(r'(-?\d+(?:,\d{3})*\.\d{2,4})\s+(-?\d+(?:,\d{3})*\.\d{2,4})\s*$'),
+    ]
+
+    def _parse_number(s: str) -> Optional[Decimal]:
+        s = s.strip()
+        # Determine format: Turkish if it has a comma followed by 2 digits at end
+        # and dots-as-thousands; English if it has a period followed by 2-4
+        # digits at end.
+        if re.search(r',\d{2}$', s):
+            try:
+                return parse_tr_decimal(s)
+            except Exception:
+                return None
+        # English: strip commas, parse as float
+        try:
+            return Decimal(s.replace(',', ''))
+        except (InvalidOperation, Exception):
+            return None
+
+    lines = full_text.split('\n')
+    blocks: list[list[str]] = []
+    current: list[str] = []
+    for raw in lines:
+        line = raw.strip()
+        if not line:
+            continue
+        if date_prefix_re.match(line):
+            if current:
+                blocks.append(current)
+            current = [line]
+        elif current:
+            current.append(line)
+    if current:
+        blocks.append(current)
+
+    rows: list[TransactionRow] = []
+    warnings: list[str] = []
+    for block in blocks:
+        joined = ' '.join(block)
+        # Find the first date in the block
+        dm = date_prefix_re.match(joined)
+        if not dm:
+            continue
+        date_s = dm.group(1)
+        # Try each tail pattern
+        amount = None
+        balance = None
+        desc = joined[dm.end():].strip()
+        for pat in tail_patterns:
+            tm = pat.search(joined)
+            if tm:
+                a = _parse_number(tm.group(1))
+                b = _parse_number(tm.group(2))
+                if a is not None and b is not None:
+                    amount, balance = a, b
+                    desc = joined[dm.end():tm.start()].strip()
+                    break
+        if amount is None or balance is None:
+            continue
+        # Normalize date separator to '-'
+        date_n = re.sub(r'[./]', '-', date_s)
+        # Zero-pad single-digit day/month
+        parts = date_n.split('-')
+        if len(parts) == 3:
+            try:
+                date_n = f'{int(parts[0]):02d}-{int(parts[1]):02d}-{parts[2]}'
+            except ValueError:
+                pass
+        rows.append(TransactionRow(
+            date=date_n, amount=amount, balance=balance,
+            description=desc,
+        ))
+    return rows, warnings
+
+
 def parse_generic(pdf_bytes: bytes, full_text: str, source_filename: str) -> StatementResult:
     md = StatementMetadata(bank='UNKNOWN')
 
@@ -1083,11 +1610,31 @@ def parse_generic(pdf_bytes: bytes, full_text: str, source_filename: str) -> Sta
     if period and '-' in period:
         a, b = period.split('-', 1)
         md.period_start, md.period_end = a.strip(), b.strip()
-    rows, warnings = _generic_parse_transactions(full_text)
+
+    # Strategy A: strict line-by-line patterns (the original generic logic).
+    rows_a, warnings_a = _generic_parse_transactions(full_text)
+    # Strategy B: block-accumulation (forgiving of wrapped rows).
+    rows_b, warnings_b = _generic_block_parse(full_text)
+
+    # Pick whichever extracted more rows and validates better. Prefer the one
+    # with no balance issues; tiebreak on row count.
+    cand_a_issues = len(validate_balance_chain(rows_a)) if rows_a else 999
+    cand_b_issues = len(validate_balance_chain(rows_b)) if rows_b else 999
+
+    def _score(rows: list, issues: int) -> tuple[int, int]:
+        # Lower issues wins, then higher row count wins.
+        return (issues, -len(rows))
+
+    if _score(rows_b, cand_b_issues) < _score(rows_a, cand_a_issues):
+        rows, warnings, strategy = rows_b, warnings_b, 'block-accumulation'
+    else:
+        rows, warnings, strategy = rows_a, warnings_a, 'line-by-line'
+
     warnings.insert(0,
-        "⚠ Used generic fallback parser — bank not recognized. "
-        "Results may be incomplete. Please verify carefully."
+        f"⚠ Used generic fallback parser ({strategy}) — bank not recognized. "
+        f"Results may be incomplete. Please verify carefully."
     )
+
     if len(rows) >= 2:
         try:
             first_d = pd.to_datetime(rows[0].date, format='%d-%m-%Y', errors='coerce')
@@ -1106,9 +1653,12 @@ def parse_generic(pdf_bytes: bytes, full_text: str, source_filename: str) -> Sta
 # =============================================================================
 
 PARSERS: dict[str, Callable[[bytes, str, str], StatementResult]] = {
-    'HALKBANK': parse_halkbank,
-    'AKBANK': parse_akbank,
-    'ZIRAAT': parse_ziraat,
+    'HALKBANK':      parse_halkbank,
+    'AKBANK':        parse_akbank,
+    'ZIRAAT':        parse_ziraat,
+    'YAPIKREDI':     parse_yapikredi,
+    'KUVEYTTURK':    parse_kuveytturk,
+    'TURKIYEFINANS': parse_turkiyefinans,
 }
 
 
@@ -1140,43 +1690,100 @@ def validate_final_balance(result: StatementResult) -> Optional[bool]:
 # =============================================================================
 
 def process_pdf(pdf_bytes: bytes, filename: str) -> StatementResult:
-    text = extract_pdf_text(pdf_bytes)
+    """Main entry point. Wraps every stage in try/except so a single bad
+    PDF never takes down the run. If the detected-bank parser returns zero
+    rows we automatically retry with the generic block-accumulation parser
+    — that way we never silently drop data when a layout drifts."""
+    try:
+        text = extract_pdf_text(pdf_bytes)
+    except Exception as exc:
+        result = StatementResult(
+            source_filename=filename,
+            metadata=StatementMetadata(bank='UNKNOWN'),
+            parser_warnings=[f"Could not read PDF text: {exc}"],
+        )
+        return result
 
     # Detection: try the embedded text layer first. If it's empty (scanned PDF),
     # fall back to a small OCR sample of page 1 just for bank detection.
-    bank = detect_bank(text) if text.strip() else None
-    if bank is None and not text.strip() and OCR_AVAILABLE:
-        try:
-            sample = _ocr_pages(pdf_bytes, dpi=300, lang='tur')
-            if sample:
-                bank = detect_bank(sample[0]['text'])
-        except Exception:
-            pass
+    bank = None
+    try:
+        bank = detect_bank(text) if text.strip() else None
+        if bank is None and not text.strip() and OCR_AVAILABLE:
+            try:
+                sample = _ocr_pages(pdf_bytes, dpi=300, lang='tur')
+                if sample:
+                    bank = detect_bank(sample[0]['text'])
+            except Exception:
+                pass
+    except Exception as exc:
+        bank = None
 
-    if bank is not None and bank in PARSERS:
-        result = PARSERS[bank](pdf_bytes, text, filename)
-    elif bank is not None:
-        result = parse_generic(pdf_bytes, text, filename)
-        result.metadata.bank = bank
-        result.parser_warnings.insert(
-            0, f"Detected {bank} but no dedicated parser. Using generic fallback."
-        )
-    else:
-        result = parse_generic(pdf_bytes, text, filename)
-        if not text.strip():
+    # Primary parser attempt.
+    result: Optional[StatementResult] = None
+    try:
+        if bank is not None and bank in PARSERS:
+            result = PARSERS[bank](pdf_bytes, text, filename)
+        elif bank is not None:
+            result = parse_generic(pdf_bytes, text, filename)
+            result.metadata.bank = bank
             result.parser_warnings.insert(
-                0,
-                "PDF has no embedded text (scanned/image-only) and OCR was "
-                "not available or did not detect a known bank. Install OCR "
-                "dependencies (see top of file) or upload a vector PDF."
+                0, f"Detected {bank} but no dedicated parser. Using generic fallback."
             )
         else:
-            result.parser_warnings.insert(
-                0, f"[DEBUG] Bank not detected. First 300 chars: {repr(text[:300])}"
-            )
+            result = parse_generic(pdf_bytes, text, filename)
+            if not text.strip():
+                result.parser_warnings.insert(
+                    0,
+                    "PDF has no embedded text (scanned/image-only) and OCR was "
+                    "not available or did not detect a known bank. Install OCR "
+                    "dependencies (see top of file) or upload a vector PDF."
+                )
+            else:
+                result.parser_warnings.insert(
+                    0, f"[DEBUG] Bank not detected. First 300 chars: {repr(text[:300])}"
+                )
+    except Exception as exc:
+        result = StatementResult(
+            source_filename=filename,
+            metadata=StatementMetadata(bank=bank or 'UNKNOWN'),
+            parser_warnings=[
+                f"Dedicated parser for {bank or 'UNKNOWN'} crashed: {exc}. "
+                "Falling back to generic parser."
+            ],
+        )
 
-    result.balance_issues = validate_balance_chain(result.rows)
-    result.final_balance_match = validate_final_balance(result)
+    # Safety net: if the dedicated parser found zero rows but the PDF has text,
+    # retry with the generic block parser. The user gets *something* rather
+    # than a silent empty result.
+    if result is not None and len(result.rows) == 0 and text.strip() and bank in PARSERS:
+        try:
+            fallback = parse_generic(pdf_bytes, text, filename)
+            if len(fallback.rows) > 0:
+                # Keep original metadata (it was bank-specific) but use fallback rows.
+                result.rows = fallback.rows
+                result.parser_warnings.insert(
+                    0,
+                    f"Dedicated {bank} parser found 0 rows; recovered "
+                    f"{len(fallback.rows)} via generic block parser. "
+                    f"Verify the balance chain below before trusting."
+                )
+        except Exception:
+            pass  # Generic fallback also failed — keep the empty result.
+
+    if result is None:
+        result = StatementResult(
+            source_filename=filename,
+            metadata=StatementMetadata(bank='UNKNOWN'),
+            parser_warnings=["Unknown error during parsing — no result produced."],
+        )
+
+    # Always run validations — even on empty rows, it just yields [].
+    try:
+        result.balance_issues = validate_balance_chain(result.rows)
+        result.final_balance_match = validate_final_balance(result)
+    except Exception as exc:
+        result.parser_warnings.append(f"Balance validation crashed: {exc}")
     return result
 
 
