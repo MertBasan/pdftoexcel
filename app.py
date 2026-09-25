@@ -6,6 +6,8 @@ Supported banks: Halkbank (V1 + V2 layouts), Akbank, Ziraat (vector + scanned/OC
 Unknown banks: generic fallback parser with auto-detected row patterns.
 
 Output columns: TARIH | Saat | TUTAR | Bakiye | ACIKLAMA | DEKONT
+(Saat / DEKONT stay empty when the PDF has no such column, e.g. the
+ Halkbank "Mevduat Hesap Cüzdanı" layout only has Tarih/Açıklama/Tutar/Bakiye.)
 
 DEPLOYMENT
 ----------
@@ -691,12 +693,17 @@ def _hb_parse_transactions(full_text: str) -> tuple[list[TransactionRow], list[s
                 warnings.append(warn)
         v3_date, v3_lines = None, []
 
+    after_table_header = False  # True between a page's table header and its first date row
+
     for raw in full_text.split('\n'):
         line = raw.rstrip('\r').rstrip()
         stripped = line.strip()
         if not stripped:
             continue
-        if stripped.startswith('İşlem Tarihi') or stripped.startswith('Sayfa No'):
+        if stripped.startswith('İşlem Tarihi'):
+            after_table_header = True
+            continue
+        if stripped.startswith('Sayfa No'):
             continue
         if stripped in _HB_SKIP_EXACT:
             continue
@@ -708,7 +715,11 @@ def _hb_parse_transactions(full_text: str) -> tuple[list[TransactionRow], list[s
         ):
             _flush_v1v2()
             _flush_v3()
+            after_table_header = False
             continue
+
+        if _HB_DATE_LINE_RE.match(stripped):
+            after_table_header = False
 
         m = _HB_ROW_V1.match(line)
         if m:
@@ -770,7 +781,12 @@ def _hb_parse_transactions(full_text: str) -> tuple[list[TransactionRow], list[s
                 continue
             v3_lines.append(stripped)
             continue
-        # Stray line before any row has started (e.g. header metadata) — ignore.
+        # Text at the top of a page, before its first date row, is the
+        # continuation of the last row of the previous page.
+        if after_table_header and rows:
+            rows[-1].description = (rows[-1].description + ' ' + stripped).strip()
+            continue
+        # Otherwise: stray line before any row has started — ignore.
 
     _flush_v1v2()
     _flush_v3()
@@ -780,11 +796,229 @@ def _hb_parse_transactions(full_text: str) -> tuple[list[TransactionRow], list[s
     return rows, warnings
 
 
+# -----------------------------------------------------------------------------
+# 5B. Halkbank POSITIONAL parser (column-aware, overlap-safe)
+# -----------------------------------------------------------------------------
+# Why this exists
+# ---------------
+# In the "Mevduat Hesap Cüzdanı" layout, a long description with no spaces
+# (e.g. '22410060612959600343805000/HARUNMETALMAKİNASANAYİVETİCARE...')
+# physically runs OVER the 'İşlem Tutarı' column. pdfplumber's
+# extract_text() sorts characters left-to-right, so the description letters
+# and the amount digits get interleaved ('-C4A3R.8E5T6L,İ1M0...') and the
+# description is lost.
+#
+# The fix: read the characters in the order the PDF *drew* them. The
+# description is one drawing operation and the amount is another, so they
+# come out as separate "runs". Each run is then assigned to a column by its
+# x-position relative to the table header ('İşlem Tarihi / Açıklama /
+# İşlem Tutarı / Bakiye'). Lines at the top of a page before the first date
+# are continuation text of the last row on the previous page.
+
+_HB_POS_DATE_RE = re.compile(r'^\d{2}\.\d{2}\.\d{4}$')
+_HB_POS_DATE_PREFIX_RE = re.compile(r'^(\d{2}\.\d{2}\.\d{4})\s+(.+)$')
+_HB_POS_MONEY_RE = re.compile(r'^-?\d{1,3}(?:\.\d{3})*,\d{2}$')
+_HB_POS_FOOTER_RE = re.compile(
+    r'^(?:\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}:\d{2}|Bu belge|Bu dokümana|'
+    r'TÜRKİYE HALK|Finanskent|Sayfa\s+\d|E-İmzalı|Mevduat Hesap Cüzdanı|'
+    r'elektronik imza|\d{1,3}\s*/\s*\d{1,3}$)'
+)
+
+
+_HB_POS_SKIP_RE = re.compile(r'^(?:HESAP HAREKETLERİ|İşlem Tarihi|HALKBANK)\b')
+
+
+def _clean_text(s: str) -> str:
+    """NFKC-normalise (expands ligature glyphs such as 'ﬁ' -> 'fi'), drop
+    control characters, collapse whitespace."""
+    import unicodedata
+    s = unicodedata.normalize('NFKC', s)
+    s = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', s)
+    return re.sub(r'\s+', ' ', s).strip()
+
+
+def _page_runs(page) -> list[dict]:
+    """Group the page's characters into runs in DRAWING order.
+
+    A new run starts whenever the next character is not the natural
+    continuation of the previous one (different line, jumps backwards, or
+    leaves a big gap). This keeps an overflowing description and the amount
+    it overlaps as two separate pieces of text."""
+    runs: list[dict] = []
+    cur: Optional[dict] = None
+    for ch in page.chars:
+        t = ch.get('text', '')
+        if t == '':
+            continue
+        size = ch.get('size') or 8.0
+        if cur is not None:
+            same_line = abs(ch['top'] - cur['_last_top']) <= max(1.5, 0.35 * size)
+            gap = ch['x0'] - cur['x1']
+            if same_line and -0.35 * size <= gap <= 0.9 * size:
+                if gap > 0.2 * size and not t.isspace() and not cur['text'].endswith(' '):
+                    cur['text'] += ' '
+                cur['text'] += t
+                cur['x1'] = max(cur['x1'], ch['x1'])
+                cur['bottom'] = max(cur['bottom'], ch['bottom'])
+                cur['_last_top'] = ch['top']
+                continue
+            runs.append(cur)
+        cur = {'text': t, 'x0': ch['x0'], 'x1': ch['x1'], 'top': ch['top'],
+               'bottom': ch['bottom'], '_last_top': ch['top']}
+    if cur is not None:
+        runs.append(cur)
+    out = []
+    for r in runs:
+        # Trim leading/trailing spaces without losing the x-extent meaning.
+        txt = r['text'].strip()
+        if txt:
+            r['text'] = txt
+            out.append(r)
+    return out
+
+
+def _hb_find_table_header(page) -> Optional[dict]:
+    """Locate the column header row and return column geometry."""
+    try:
+        words = page.extract_words(keep_blank_chars=False, use_text_flow=False)
+    except Exception:
+        return None
+    by_text: dict[str, list[dict]] = {}
+    for w in words:
+        by_text.setdefault(w['text'], []).append(w)
+    for tarihi in by_text.get('Tarihi', []):
+        line = [w for w in words if abs(w['top'] - tarihi['top']) < 3]
+        texts = {w['text']: w for w in line}
+        if 'Açıklama' in texts and 'Bakiye' in texts and ('Tutarı' in texts or 'Tutar' in texts):
+            tutar = texts.get('Tutarı') or texts.get('Tutar')
+            return {
+                'desc_left': texts['Açıklama']['x0'],
+                'amt_right': tutar['x1'],
+                'bal_right': texts['Bakiye']['x1'],
+                'bottom': max(w['bottom'] for w in line),
+            }
+    return None
+
+
+def _hb_parse_positional(pdf_bytes: bytes) -> tuple[list[TransactionRow], list[str]]:
+    rows: list[TransactionRow] = []
+    warnings: list[str] = []
+    # Each pending row: {'date', 'amount', 'balance', 'desc': [(page, top, x0, text)]}
+    pending: list[dict] = []
+
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for pno, page in enumerate(pdf.pages):
+            hdr = _hb_find_table_header(page)
+            if hdr is None:
+                continue  # terms & conditions pages etc.
+            runs = _page_runs(page)
+            below = [r for r in runs if r['top'] > hdr['bottom'] + 0.5]
+            footer_tops = [r['top'] for r in below if _HB_POS_FOOTER_RE.match(r['text'])]
+            footer_top = min(footer_tops) if footer_tops else float(page.height)
+            body = [r for r in below if r['top'] < footer_top - 0.5
+                    and not _HB_POS_SKIP_RE.match(r['text'])]
+
+            date_limit = hdr['desc_left'] - 2
+            col_gap = hdr['bal_right'] - hdr['amt_right']
+            tol = max(12.0, 0.35 * col_gap)
+
+            anchors: list[dict] = []
+            others: list[dict] = []
+            for r in body:
+                txt = r['text']
+                if r['x0'] < date_limit:
+                    if _HB_POS_DATE_RE.match(txt):
+                        anchors.append({'run': r, 'date': txt, 'amount': None,
+                                        'balance': None, 'desc': []})
+                        continue
+                    m = _HB_POS_DATE_PREFIX_RE.match(txt)
+                    if m:  # date and description drawn in one operation
+                        anchors.append({'run': r, 'date': m.group(1), 'amount': None,
+                                        'balance': None, 'desc': []})
+                        others.append({**r, 'text': m.group(2), 'x0': hdr['desc_left']})
+                        continue
+                others.append(r)
+
+            anchors.sort(key=lambda a: a['run']['top'])
+            for o in others:
+                owner = None
+                for a in anchors:
+                    if a['run']['top'] <= o['top'] + 3:
+                        owner = a
+                    else:
+                        break
+                txt = o['text']
+                is_money = bool(_HB_POS_MONEY_RE.match(txt))
+                if owner is None:
+                    # Text above the first date on this page -> continuation
+                    # of the last row of the previous page.
+                    if pending and not is_money:
+                        pending[-1]['desc'].append((pno, o['top'], o['x0'], txt))
+                    elif not is_money:
+                        pass  # stray text before any transaction: ignore
+                    else:
+                        warnings.append(f"Halkbank: orphan number {txt!r} on page {pno + 1} ignored.")
+                    continue
+                if is_money and abs(o['x1'] - hdr['bal_right']) <= tol and owner['balance'] is None:
+                    owner['balance'] = txt
+                elif is_money and abs(o['x1'] - hdr['amt_right']) <= tol and owner['amount'] is None:
+                    owner['amount'] = txt
+                else:
+                    owner['desc'].append((pno, o['top'], o['x0'], txt))
+            pending.extend(anchors)
+
+    for a in pending:
+        if a['amount'] is None or a['balance'] is None:
+            warnings.append(
+                f"Halkbank (positional): row {a['date']} missing "
+                f"{'amount' if a['amount'] is None else 'balance'} — skipped."
+            )
+            continue
+        try:
+            amount = parse_tr_decimal(a['amount'])
+            balance = parse_tr_decimal(a['balance'])
+        except InvalidOperation as exc:
+            warnings.append(f"Halkbank (positional): bad number at {a['date']}: {exc}")
+            continue
+        parts = sorted(a['desc'], key=lambda d: (d[0], round(d[1]), d[2]))
+        desc = _clean_text(' '.join(p[3] for p in parts))
+        rows.append(TransactionRow(date=_normalize_date(a['date']), amount=amount,
+                                   balance=balance, description=desc))
+    return rows, warnings
+
+
+
 def parse_halkbank(pdf_bytes: bytes, full_text: str, source_filename: str) -> StatementResult:
+    """Run BOTH the positional (column-aware) parser and the text parser,
+    then keep whichever reconciles better against the balance chain.
+    Ties go to the positional parser because it keeps descriptions intact
+    when they overflow into the amount column."""
     metadata = _hb_extract_metadata(pdf_bytes)
-    rows, warnings = _hb_parse_transactions(full_text)
+    try:
+        pos_rows, pos_warn = _hb_parse_positional(pdf_bytes)
+    except Exception as exc:
+        pos_rows, pos_warn = [], [f"Halkbank positional parser error: {exc}"]
+    txt_rows, txt_warn = _hb_parse_transactions(full_text)
+    for r in txt_rows:
+        r.description = _clean_text(r.description)
+
+    def score(rows: list[TransactionRow]) -> tuple[int, int]:
+        if not rows:
+            return (10**9, 0)
+        return (len(validate_balance_chain(rows)), -len(rows))
+
+    info: list[str] = []
+    if pos_rows and score(pos_rows) <= score(txt_rows):
+        rows, warnings = pos_rows, pos_warn
+        info.append("Halkbank: column-aware (positional) extraction used.")
+    else:
+        rows, warnings = txt_rows, txt_warn
+        info.append("Halkbank: text-line extraction used.")
+    for r in rows:
+        if not r.receipt:
+            r.receipt = _hb_extract_dekont(r.description)
     return StatementResult(source_filename=source_filename, metadata=metadata,
-                           rows=rows, parser_warnings=warnings)
+                           rows=rows, parser_warnings=warnings, parser_info=info)
 
 
 # =============================================================================
@@ -2080,13 +2314,21 @@ def df_to_xlsx_bytes(df: pd.DataFrame) -> bytes:
         df.to_excel(writer, sheet_name='Hareketler', index=False)
         ws = writer.sheets['Hareketler']
 
+        # Explicit widths: a date/number wider than its column is what makes
+        # Excel show '#####'. Dates need ~11 chars, amounts up to ~16.
+        fixed_widths = {'TARİH': 13, 'Saat': 9, 'TUTAR': 17, 'Bakiye': 17, 'DEKONT': 16}
         for i, col in enumerate(df.columns, start=1):
-            try:
-                sample = df[col].astype(str)
-                width = min(60, max(12, int(sample.str.len().quantile(0.95)) + 2))
-            except Exception:
-                width = 18
+            if col in fixed_widths:
+                width = fixed_widths[col]
+            else:
+                try:
+                    lengths = df[col].astype(str).str.len()
+                    width = min(100, max(14, int(lengths.max()) + 2))
+                except Exception:
+                    width = 40
             ws.column_dimensions[get_column_letter(i)].width = width
+        ws.freeze_panes = 'A2'
+        ws.auto_filter.ref = ws.dimensions
 
         n_data_rows = len(df)
         last_row = n_data_rows + 1
@@ -2100,7 +2342,7 @@ def df_to_xlsx_bytes(df: pd.DataFrame) -> bytes:
             if col_name in df.columns and n_data_rows:
                 col_letter = get_column_letter(df.columns.get_loc(col_name) + 1)
                 for row_idx in range(2, last_row + 1):
-                    ws[f'{col_letter}{row_idx}'].number_format = '#,##0.00;-#,##0.00'
+                    ws[f'{col_letter}{row_idx}'].number_format = '#,##0.00'
 
         if dekont_is_numeric and 'DEKONT' in df.columns and n_data_rows:
             col_letter = get_column_letter(df.columns.get_loc('DEKONT') + 1)
@@ -2123,11 +2365,19 @@ def df_to_xlsx_bytes(df: pd.DataFrame) -> bytes:
 _CONTROL_CHAR_RE = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
 
 
-def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
+def df_to_csv_bytes(df: pd.DataFrame, turkish_excel: bool = True) -> bytes:
+    """CSV export.
+
+    turkish_excel=True  (default): ';' separator, ',' decimal, DD.MM.YYYY.
+        This is what Excel expects on a Turkish-locale Windows. With ','
+        as separator Turkish Excel puts every field into column A.
+    turkish_excel=False: ',' separator, '.' decimal, YYYY-MM-DD (international /
+        Python / Google Sheets in English locale).
+    """
     df = df.copy()
-    # Format date column as DD-MM-YYYY for CSV (universal & locale-safe)
     if 'TARİH' in df.columns:
-        df['TARİH'] = pd.to_datetime(df['TARİH'], errors='coerce').dt.strftime('%d-%m-%Y')
+        fmt = '%d.%m.%Y' if turkish_excel else '%Y-%m-%d'
+        df['TARİH'] = pd.to_datetime(df['TARİH'], errors='coerce').dt.strftime(fmt).fillna('')
     for col in ('TUTAR', 'Bakiye'):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce')
@@ -2136,7 +2386,21 @@ def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
             df[col] = df[col].apply(
                 lambda v: _CONTROL_CHAR_RE.sub('', v) if isinstance(v, str) else v
             )
-    return df.to_csv(index=False, float_format='%.2f').encode('utf-8-sig')
+    if turkish_excel:
+        out = df.to_csv(index=False, sep=';', decimal=',', float_format='%.2f')
+    else:
+        out = df.to_csv(index=False, sep=',', float_format='%.2f')
+    return out.encode('utf-8-sig')
+
+
+def dataframe_display_config() -> dict:
+    """Column formatting for st.dataframe (no '00:00:00' on dates)."""
+    return {
+        'TARİH': st.column_config.DateColumn('TARİH', format='DD.MM.YYYY'),
+        'TUTAR': st.column_config.NumberColumn('TUTAR', format='%.2f'),
+        'Bakiye': st.column_config.NumberColumn('Bakiye', format='%.2f'),
+        'AÇIKLAMA': st.column_config.TextColumn('AÇIKLAMA', width='large'),
+    }
 
 
 # =============================================================================
@@ -2292,6 +2556,16 @@ def main() -> None:
     if 'results' not in st.session_state:
         st.session_state.results = []
 
+    csv_choice = st.radio(
+        "CSV format",
+        ["Turkish Excel (; separator, 1.234,56)", "International (, separator, 1234.56)"],
+        horizontal=True,
+        help="Opening a CSV in Turkish-locale Excel needs ';' as separator, "
+             "otherwise all data lands in one column. The .xlsx download works "
+             "everywhere and is recommended.",
+    )
+    turkish_csv = csv_choice.startswith("Turkish")
+
     uploaded = st.file_uploader(
         "Upload PDF statements or a ZIP folder containing them",
         type=['pdf', 'zip'],
@@ -2339,7 +2613,8 @@ def main() -> None:
 
             if n_rows > 0:
                 df = result_to_dataframe(res)
-                st.dataframe(df.head(20), width='stretch')
+                st.dataframe(df, width='stretch', hide_index=True,
+                             column_config=dataframe_display_config())
 
                 base = build_output_basename(res)
                 dl1, dl2 = st.columns(2)
@@ -2352,7 +2627,7 @@ def main() -> None:
                 )
                 dl2.download_button(
                     f"⬇ {base}.csv",
-                    data=df_to_csv_bytes(df),
+                    data=df_to_csv_bytes(df, turkish_excel=turkish_csv),
                     file_name=f"{base}.csv",
                     mime="text/csv",
                     key=f"csv_{idx}",
@@ -2376,7 +2651,8 @@ def main() -> None:
         st.info(f"Removed {before - after} duplicate row(s) across uploads.")
 
     st.write(f"**Total rows: {len(combined):,}**")
-    st.dataframe(combined.head(50), width='stretch')
+    st.dataframe(combined, width='stretch', hide_index=True,
+                 column_config=dataframe_display_config())
 
     dl1, dl2 = st.columns(2)
     dl1.download_button(
@@ -2387,7 +2663,7 @@ def main() -> None:
     )
     dl2.download_button(
         "⬇ combined.csv",
-        data=df_to_csv_bytes(combined),
+        data=df_to_csv_bytes(combined, turkish_excel=turkish_csv),
         file_name="combined_bank_statements.csv",
         mime="text/csv",
     )
