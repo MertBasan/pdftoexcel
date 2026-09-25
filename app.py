@@ -446,6 +446,118 @@ _HB_ROW_V2 = re.compile(
 
 _HB_DEKONT_RE = re.compile(r'/(\d{10,})\s*$')
 
+# --- Halkbank "V3" layout -----------------------------------------------
+# Some cüzdan/statement exports wrap each row across multiple lines instead
+# of putting date+amount+balance on one line (V1/V2). A row looks like:
+#     19.06.2026 1018251326 ,Hgs ,OTM
+#     ÖDEME,50065400,34ZU5052
+#     -1.000,00 7.367,53
+# i.e. a date-starting line, zero or more description continuation lines,
+# then a line ending in "amount balance". Occasionally a PDF column-overlap
+# glitch glues the amount into the middle of the description text on a
+# single line (e.g. "...SANA-43.856,10 YİVE...ŞİRKE/SGK(Mosip 1.869,40").
+# We handle both cases the same way: accumulate all lines belonging to one
+# transaction into a block, then scan the WHOLE block for every
+# Turkish-decimal money-looking substring and take the LAST TWO as
+# (amount, balance) — this is safe because Halkbank descriptions here never
+# contain their own comma-decimal formatted numbers.
+_HB_DATE_LINE_RE = re.compile(r'^(\d{2}\.\d{2}\.\d{4})\b')
+# (?<!\d) / (?!\d) stop this from matching a money-shaped substring embedded
+# inside a longer reference/account number, e.g. '...50065400,34ZU5052'
+# contains '400,34' but that is NOT an amount — it's part of '50065400'.
+_HB_MONEY_ANY_RE = re.compile(r'(?<!\d)-?\d{1,3}(?:\.\d{3})*,\d{2}(?!\d)')
+# Fallback used only when the normal pass finds fewer than 2 numbers: strips
+# every character that isn't a digit/./,/-, which recovers rows where a PDF
+# column-overlap glitch has interleaved two text runs character-by-character
+# (e.g. '-T2A5L.M02A0K,0İN0...' really encodes '-25.020,00...').
+_HB_DIGIT_ONLY_RE = re.compile(r'[^\d.,\-]')
+
+# Lines that mark a page footer/header boundary — always close out whatever
+# V3 block is open (a transaction never legitimately continues past these).
+_HB_BLOCK_STOP_PREFIXES = (
+    'Bu belge', 'Bu dokümana', 'TÜRKİYE HALK BANKASI', 'TÜRKİYE HALKBANK',
+    'Finanskent', 'Mevduat Hesap Cüzdanı', 'Sayfa ', 'HESAP HAREKETLERİ',
+    'MÜŞTERİ BİLGİLERİ', 'HESAP BİLGİLERİ', 'CÜZDAN BİLGİLERİ',
+    'E-İmzalıdır', 'HALKBANK',
+)
+_HB_FOOTER_TIMESTAMP_RE = re.compile(r'^\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}:\d{2}')
+
+
+def _hb_finalize_v3_block(date_str: str, block_lines: list[str],
+                          prev_balance: Optional[Decimal] = None):
+    """Parse one accumulated V3 block. Returns (TransactionRow | None, warning | None).
+    `prev_balance` (the previous row's balance) is used only for the
+    glued-text recovery pass, to validate a candidate split of the amount
+    and balance numbers against the balance chain."""
+    joined = ' '.join(l for l in block_lines if l)
+    matches = list(_HB_MONEY_ANY_RE.finditer(joined))
+
+    if len(matches) >= 2:
+        m_amt, m_bal = matches[-2], matches[-1]
+        try:
+            amount = parse_tr_decimal(m_amt.group())
+            balance = parse_tr_decimal(m_bal.group())
+        except InvalidOperation as exc:
+            return None, f"Halkbank: malformed amount/balance at {date_str}: {exc}"
+        desc = (
+            joined[:m_amt.start()] + ' ' +
+            joined[m_amt.end():m_bal.start()] + ' ' +
+            joined[m_bal.end():]
+        )
+        desc = re.sub(r'\s+', ' ', desc).strip()
+        return TransactionRow(date=_normalize_date(date_str), amount=amount,
+                              balance=balance, description=desc), None
+
+    # Recovery pass: a PDF column-overlap glitch occasionally interleaves the
+    # amount/balance digits with description letters character-by-character
+    # (e.g. '-T2A5L.M02A0K,0İN0ASANAYİVETİCARE5.242,89' really encodes
+    # '-25.020,00' and '5.242,89' with every other character stripped out).
+    # Once the junk letters are removed the two numbers can end up glued
+    # together with NO separator (e.g. '...856,101.869,40'), which is
+    # genuinely ambiguous to split by regex alone — "101.869,40" is just as
+    # valid a parse as "10" + "1.869,40". We only trust a split if it
+    # reconciles against the running balance from the previous row; if
+    # nothing reconciles we refuse to guess rather than risk a silently
+    # wrong number.
+    if prev_balance is not None:
+        digits_only = _HB_DIGIT_ONLY_RE.sub('', joined)
+        full_money_re = re.compile(r'-?\d{1,3}(?:\.\d{3})*,\d{2}')
+        bal_matches = [m for m in full_money_re.finditer(digits_only)
+                       if m.end() == len(digits_only)]
+        for bm in bal_matches:
+            for j in range(bm.start() - 1, max(-1, bm.start() - 25), -1):
+                cand = digits_only[j:bm.start()]
+                if not full_money_re.fullmatch(cand):
+                    continue
+                try:
+                    cand_amount = parse_tr_decimal(cand)
+                    cand_balance = parse_tr_decimal(bm.group())
+                except InvalidOperation:
+                    continue
+                if prev_balance + cand_amount == cand_balance:
+                    clean_lines = [
+                        l for l in block_lines
+                        if l and not _HB_MONEY_ANY_RE.search(_HB_DIGIT_ONLY_RE.sub('', l))
+                    ]
+                    desc = ' '.join(clean_lines).strip()
+                    warn = (
+                        f"Halkbank: row at {date_str} had overlapping/glued PDF "
+                        f"text — amount and balance were recovered and verified "
+                        f"against the running balance, but part of the "
+                        f"description may be missing. Verify against the source PDF."
+                    )
+                    return TransactionRow(
+                        date=_normalize_date(date_str), amount=cand_amount,
+                        balance=cand_balance, description=desc,
+                    ), warn
+
+    return None, (
+        f"Halkbank: only {len(matches)} clean amount-like number(s) found for "
+        f"{date_str} and automatic recovery did not reconcile against the "
+        f"running balance — row SKIPPED, enter it manually. "
+        f"Line content: {joined[:150]!r}"
+    )
+
 
 def _hb_extract_dekont(description: str) -> str:
     m = _HB_DEKONT_RE.search(description)
@@ -456,40 +568,48 @@ def _hb_strip_right_column(line: str) -> str:
     right_anchors = (
         r'\s+(?:Üretim\s+Zamanı|Dönemi|Hesap\s+Bakiyesi|Bloke\s+Bakiyesi|'
         r'Kullanılabilir(?:\s+\w+)*|Toplam\s+Kredi|Bakiye\s+Bilgileriniz|'
-        r'Hesap\s+Özeti)\s*:'
+        r'Hesap\s+Özeti|Şube\s+Kodu(?:/Adı)?|Şube\s+Adı|Hesap\s+No|'
+        r'Iban|IBAN|Para\s+Cinsi|Hesap\s+Adı|Açılış\s+Tarihi|Ürün\s+Adı|'
+        r'Müşteri\s+No|Müşteri\s+TCKN|Cüzdan\s+Seri\s+No)\s*:'
     )
     return re.split(right_anchors, line, maxsplit=1)[0].rstrip()
 
 
+_HB_NAME_LABEL_RE = re.compile(
+    r'(?:Müşteri Adı\s*/\s*Ünvanı|Adı Soyadı\s*/\s*Unvanı)\s*:\s*(.*)$'
+)
+_HB_NEXT_LABEL_RE = re.compile(
+    r'^(TCKN|Hesap|Bakiye|Şube|Döviz|IBAN|Iban|Bloke|Toplam|Müşteri|Müşter|'
+    r'CÜZDAN|Cüzdan|Tarih|MÜŞTERİ|HESAP)\b'
+)
+
+
 def _hb_extract_customer_name(text: str) -> str:
+    """Handles both known label variants:
+      'Müşteri Adı / Ünvanı :' (older layout)
+      'Adı Soyadı/Unvanı :'    (newer cüzdan layout)
+    and collects the value even when the company name wraps onto the
+    following line(s)."""
     lines = text.split('\n')
-    for line in lines:
-        m = re.search(r'Müşteri Adı\s*/\s*Ünvanı\s*:\s*(.+)', line)
+    label_idx = None
+    inline_val = ''
+    for i, l in enumerate(lines):
+        m = _HB_NAME_LABEL_RE.search(_hb_strip_right_column(l))
         if m:
-            name = m.group(1).strip()
-            if name:
-                return name
-    label_idx = next(
-        (i for i, l in enumerate(lines) if 'Müşteri Adı / Ünvanı' in l), None)
+            label_idx = i
+            inline_val = m.group(1).strip()
+            break
     if label_idx is None:
         return ''
-    next_label_re = re.compile(r'^(TCKN|Hesap|Bakiye|Şube|Döviz|IBAN|Bloke|Toplam)\b')
-    parts: list[str] = []
-    if label_idx > 0:
-        cand = _hb_strip_right_column(lines[label_idx - 1]).strip()
-        if cand and not cand.startswith(('Müşteri', 'Hesap', 'TCKN', 'IBAN',
-                                         'Şube', 'Döviz', 'Bakiye', 'Bloke',
-                                         'Kullanıl', 'Toplam', 'Üretim', 'Dönemi',
-                                         'MÜŞTERİ', 'Dönem')):
-            parts.append(cand)
+    parts: list[str] = [inline_val] if inline_val else []
     for j in range(label_idx + 1, min(label_idx + 5, len(lines))):
         cand = _hb_strip_right_column(lines[j]).strip()
         if not cand:
             continue
-        if next_label_re.match(cand):
+        if _HB_NEXT_LABEL_RE.match(cand):
             break
         parts.append(cand)
-    return ' '.join(parts).strip()
+    return ' '.join(p for p in parts if p).strip()
 
 
 def _hb_extract_metadata(pdf_bytes: bytes) -> StatementMetadata:
@@ -509,7 +629,7 @@ def _hb_extract_metadata(pdf_bytes: bytes) -> StatementMetadata:
     md.customer_no = grab(r'Müşteri Numarası\s*:\s*(\S+)') or grab(r'Müşteri No\s*:\s*(\S+)') or ''
     md.customer_name = _hb_extract_customer_name(text)
     md.account_no = grab(r'Hesap No\s*:\s*(\S+)') or ''
-    md.iban = grab(r'IBAN\s*:\s*(\S+)') or ''
+    md.iban = grab(r'(?:IBAN|Iban)\s*:\s*(\S+)') or ''
     md.branch = grab(r'Şube Kodu / Adı\s*:\s*([^\n]+)') or ''
     if not md.branch:
         code = grab(r'Şube Kodu\s*:\s*(\S+)') or ''
@@ -525,6 +645,15 @@ def _hb_extract_metadata(pdf_bytes: bytes) -> StatementMetadata:
     if period and '-' in period:
         a, b = period.split('-', 1)
         md.period_start, md.period_end = a.strip(), b.strip()
+    else:
+        # Newer cüzdan layout has no "Dönemi:" label — instead:
+        # "HESAP HAREKETLERİ  17.06.2026 - 15.09.2026 tarihleri arasındaki..."
+        pm = re.search(
+            r'HESAP HAREKETLERİ\D*?([\d.]{8,10})\s*-\s*([\d.]{8,10})\s+tarihleri',
+            text,
+        )
+        if pm:
+            md.period_start, md.period_end = pm.group(1), pm.group(2)
     bal = grab(r'Hesap Bakiyesi\s*:\s*([\-\d.,]+)', source=text)
     if bal:
         try:
@@ -541,7 +670,26 @@ def _normalize_date(date_str: str) -> str:
 def _hb_parse_transactions(full_text: str) -> tuple[list[TransactionRow], list[str]]:
     rows: list[TransactionRow] = []
     warnings: list[str] = []
-    current: Optional[TransactionRow] = None
+    current: Optional[TransactionRow] = None   # open V1/V2 single-line row
+    v3_date: Optional[str] = None              # open V3 multi-line block
+    v3_lines: list[str] = []
+
+    def _flush_v1v2() -> None:
+        nonlocal current
+        if current is not None:
+            rows.append(current)
+        current = None
+
+    def _flush_v3() -> None:
+        nonlocal v3_date, v3_lines
+        if v3_date is not None:
+            prev_balance = rows[-1].balance if rows else None
+            row, warn = _hb_finalize_v3_block(v3_date, v3_lines, prev_balance)
+            if row is not None:
+                rows.append(row)
+            if warn:
+                warnings.append(warn)
+        v3_date, v3_lines = None, []
 
     for raw in full_text.split('\n'):
         line = raw.rstrip('\r').rstrip()
@@ -552,32 +700,41 @@ def _hb_parse_transactions(full_text: str) -> tuple[list[TransactionRow], list[s
             continue
         if stripped in _HB_SKIP_EXACT:
             continue
+
+        # Page footer / header boilerplate: never part of a transaction —
+        # close out whatever block is open and discard the line itself.
+        if _HB_FOOTER_TIMESTAMP_RE.match(stripped) or any(
+            stripped.startswith(p) for p in _HB_BLOCK_STOP_PREFIXES
+        ):
+            _flush_v1v2()
+            _flush_v3()
+            continue
+
         m = _HB_ROW_V1.match(line)
         if m:
-            if current is not None:
-                rows.append(current)
+            _flush_v1v2()
+            _flush_v3()
             date_str, amount_str, balance_str, desc = m.groups()
             try:
                 amount = parse_tr_decimal(amount_str)
                 balance = parse_tr_decimal(balance_str)
             except InvalidOperation as exc:
                 warnings.append(f"Skipped malformed row at {date_str}: {exc}")
-                current = None
                 continue
             current = TransactionRow(date=date_str, amount=amount, balance=balance,
                                      description=desc.strip())
             continue
+
         m2 = _HB_ROW_V2.match(line)
         if m2:
-            if current is not None:
-                rows.append(current)
+            _flush_v1v2()
+            _flush_v3()
             date_str, amount_str, amount_sign, balance_str, balance_sign, desc = m2.groups()
             try:
                 amount = parse_tr_decimal(amount_str)
                 balance = parse_tr_decimal(balance_str)
             except InvalidOperation as exc:
                 warnings.append(f"Skipped malformed row at {date_str}: {exc}")
-                current = None
                 continue
             if amount_sign == '-':
                 amount = -amount
@@ -586,15 +743,38 @@ def _hb_parse_transactions(full_text: str) -> tuple[list[TransactionRow], list[s
             current = TransactionRow(date=_normalize_date(date_str), amount=amount,
                                      balance=balance, description=desc.strip())
             continue
-        if current is None:
+
+        dm = _HB_DATE_LINE_RE.match(stripped)
+        if dm:
+            # Starts with a bare "DD.MM.YYYY" that V1/V2 didn't match —
+            # this is the start of a new V3 multi-line transaction block.
+            _flush_v1v2()
+            _flush_v3()
+            v3_date = dm.group(1)
+            rest = stripped[dm.end():].strip()
+            v3_lines = [rest] if rest else []
             continue
-        if stripped.startswith(_HB_SKIP_CONT_PREFIXES):
+
+        # Continuation line — belongs to whichever row is currently open.
+        if current is not None:
+            if stripped.startswith(_HB_SKIP_CONT_PREFIXES):
+                continue
+            if stripped.startswith('Ekstrenize') or stripped.startswith('Türkiye Halk Bankası'):
+                continue
+            current.description += stripped
             continue
-        if stripped.startswith('Ekstrenize') or stripped.startswith('Türkiye Halk Bankası'):
+        if v3_date is not None:
+            if stripped.startswith(_HB_SKIP_CONT_PREFIXES):
+                continue
+            if stripped.startswith('Ekstrenize') or stripped.startswith('Türkiye Halk Bankası'):
+                continue
+            v3_lines.append(stripped)
             continue
-        current.description += stripped
-    if current is not None:
-        rows.append(current)
+        # Stray line before any row has started (e.g. header metadata) — ignore.
+
+    _flush_v1v2()
+    _flush_v3()
+
     for r in rows:
         r.receipt = _hb_extract_dekont(r.description)
     return rows, warnings
@@ -1867,8 +2047,20 @@ def df_to_xlsx_bytes(df: pd.DataFrame) -> bytes:
     """Write Excel with proper data types so Excel sees numbers as numbers
     and dates as dates — no green triangles."""
     from openpyxl.utils import get_column_letter
+    from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 
     df = df.copy()
+
+    # Excel's XML format rejects certain ASCII control characters
+    # (\x00-\x08, \x0B, \x0C, \x0E-\x1F, \x7F). These occasionally sneak
+    # into extracted text (OCR artifacts, PDF encoding quirks, glued
+    # columns) and would otherwise raise openpyxl.IllegalCharacterError
+    # and crash the whole export. Strip them from every text column first.
+    for col in df.columns:
+        if df[col].dtype == object or pd.api.types.is_string_dtype(df[col]):
+            df[col] = df[col].apply(
+                lambda v: ILLEGAL_CHARACTERS_RE.sub('', v) if isinstance(v, str) else v
+            )
 
     # DEKONT comes in as `string` dtype (uniform across files). Decide here,
     # at export time, whether to promote it to Int64 (when every non-empty
@@ -1928,6 +2120,9 @@ def df_to_xlsx_bytes(df: pd.DataFrame) -> bytes:
     return xlsx_bytes
 
 
+_CONTROL_CHAR_RE = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
+
+
 def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
     df = df.copy()
     # Format date column as DD-MM-YYYY for CSV (universal & locale-safe)
@@ -1936,6 +2131,11 @@ def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
     for col in ('TUTAR', 'Bakiye'):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce')
+    for col in df.columns:
+        if df[col].dtype == object or pd.api.types.is_string_dtype(df[col]):
+            df[col] = df[col].apply(
+                lambda v: _CONTROL_CHAR_RE.sub('', v) if isinstance(v, str) else v
+            )
     return df.to_csv(index=False, float_format='%.2f').encode('utf-8-sig')
 
 
